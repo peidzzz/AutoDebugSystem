@@ -1,0 +1,27 @@
+# ---- 工作区临时目录（体积大、可随时重建） ----
+.tools/
+.piptmp/
+logs/
+*.log
+
+# ---- 下位机（STM32F103，GCC Makefile 工程）编译产物 ----
+USBto2xUARTtool/F103-Bootloader/build/
+USBto2xUARTtool/Kernel/build/
+USBto2xUARTtool/dist/obsolete/
+# CMSIS 自带的 DSP 示例与预编译数学库（本工程未引用，体积 60MB+）
+USBto2xUARTtool/*/Drivers/CMSIS/DSP/
+USBto2xUARTtool/*/Drivers/CMSIS/Lib/
+USBto2xUARTtool/tools/openocd/_*
+
+# ---- 上位机（Wails + Go + Vue3）依赖与产物 ----
+SerialMateX/node_modules/
+SerialMateX/frontend/node_modules/
+SerialMateX/frontend/dist/
+SerialMateX/build/bin/
+SerialMateX/.idea/
+*.exe
+
+# ---- 系统/编辑器 ----
+.DS_Store
+Thumbs.db
+desktop.ini
