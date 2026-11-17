@@ -437,8 +437,13 @@ const autoCmdSelected = ref(-1);
 const autoCmdPath = ref('');
 const autoRunning = ref(false);
 type AutoCmdType = 'TX' | 'RX';
-interface AutoCmdModel { type: AutoCmdType; number: number; text: string; }
-const autoCmdDialog = reactive({ show: false, index: -1, text: '', type: 'TX' as AutoCmdType, numberText: '00', numberError: '' });
+interface AutoCmdModel { type: AutoCmdType; number: number; text: string; hex: boolean; enter: boolean; }
+// hex / enter 缺省为 false / true：只对 TX 有意义（RX 是文本包含匹配，两个开关会回落默认值），
+// 读写时必须原样带上，否则一次保存就会把 auto_cmd.txt 里的 hex=/enter= 关键字抹掉。
+const autoCmdDialog = reactive({
+  show: false, index: -1, text: '', type: 'TX' as AutoCmdType,
+  numberText: '00', numberError: '', hex: false, enter: true
+});
 const autoCmdInputRef = ref<HTMLTextAreaElement | null>(null);
 const autoCmdNumberRef = ref<HTMLInputElement | null>(null);
 // 行尾数字只保留两位（00 ~ 99）
@@ -453,7 +458,9 @@ const loadAutoCmds = async () => {
     autoCmds.value = ((list ?? []) as unknown as AutoCmdModel[]).map(c => ({
       type: (String(c?.type ?? 'TX').toUpperCase() === 'RX' ? 'RX' : 'TX') as AutoCmdType,
       number: clampCmdNumber(Number(c?.number ?? 0)),
-      text: String(c?.text ?? '')
+      text: String(c?.text ?? ''),
+      hex: !!c?.hex,
+      enter: c?.enter !== false
     }));
     autoCmdPath.value = await GetAutoCmdPath();
     if (autoCmds.value.length === 0) autoCmdSelected.value = -1;
@@ -478,14 +485,39 @@ const openAutoCmdDialog = (index: number) => {
   autoCmdDialog.type = cmd ? cmd.type : 'TX';
   autoCmdDialog.numberText = formatCmdNumber(cmd ? cmd.number : 0);
   autoCmdDialog.numberError = '';
+  // RX 行不认这两个开关，打开时也按默认值显示，避免出现“灰着却显示开”的矛盾状态
+  autoCmdDialog.hex = !!cmd && cmd.type === 'TX' && !!cmd.hex;
+  autoCmdDialog.enter = !cmd || cmd.type !== 'TX' ? true : cmd.enter !== false;
   autoCmdDialog.show = true;
   nextTick(() => autoCmdInputRef.value?.focus());
 };
 
-// 弹窗里点 TX / RX 标志即切换类型
+// 弹窗里点 TX / RX 标志即切换类型；RX 是文本包含匹配，HEX / 回车 对它没有意义，切过去就回落默认值
 const toggleDialogCmdType = () => {
   autoCmdDialog.type = autoCmdDialog.type === 'TX' ? 'RX' : 'TX';
+  if (autoCmdDialog.type === 'RX') {
+    autoCmdDialog.hex = false;
+    autoCmdDialog.enter = true;
+  }
 };
+
+// HEX 预览：规则与后端 parseHexBytes 一致——空格分隔，每段 1~2 位十六进制（可带 0x），
+// 统一补成两位大写；内容为空时 bytes 为空、仍算合法（清空后保存等于删掉这一条）。
+const hexPreview = computed(() => {
+  const raw = autoCmdDialog.text.trim();
+  if (raw === '') return { bytes: '', valid: true };
+  const bytes: string[] = [];
+  for (const field of raw.split(/\s+/)) {
+    const clean = field.replace(/^0[xX]/, '');
+    if (!/^[0-9a-fA-F]{1,2}$/.test(clean)) return { bytes: '', valid: false };
+    bytes.push(clean.toUpperCase().padStart(2, '0'));
+  }
+  return { bytes: bytes.join(' '), valid: true };
+});
+
+// HEX / 回车 只对 TX 生效；HEX 打开但内容不是合法十六进制时禁止保存
+const hexChecked = computed(() => autoCmdDialog.type === 'TX' && autoCmdDialog.hex);
+const hexInvalid = computed(() => hexChecked.value && !hexPreview.value.valid);
 
 // 功能键标记：点一下插入到光标处，后端发送前会替换成实际按键字节
 const cmdKeyButtons = [
@@ -538,7 +570,7 @@ const importAutoCmds = async () => {
 // 新增：有选中就插入到该条**上方**，否则追加到末尾；插入后立即打开编辑窗口
 const addAutoCmd = () => {
   const at = autoCmdSelected.value >= 0 ? autoCmdSelected.value : autoCmds.value.length;
-  autoCmds.value.splice(at, 0, { type: 'TX', number: 0, text: '' });
+  autoCmds.value.splice(at, 0, { type: 'TX', number: 0, text: '', hex: false, enter: true });
   autoCmdSelected.value = at;
   openAutoCmdDialog(at);
 };
@@ -558,11 +590,17 @@ const confirmAutoCmdDialog = async () => {
     autoCmdDialog.numberError = '只能输入两位数字（00 ~ 99）';
     return;
   }
+  // HEX 开着但内容不是合法十六进制：拦下保存，否则任务跑到这一条会发不出去
+  if (hexInvalid.value) return;
   const text = autoCmdDialog.text.replace(/[\r\n]+/g, ' ').trim();
   const number = clampCmdNumber(Number(autoCmdDialog.numberText || '0'));
+  // RX 是文本包含匹配，hex / enter 无意义，保存时强制回落默认值
+  const isTx = autoCmdDialog.type === 'TX';
+  const hex = isTx && autoCmdDialog.hex;
+  const enter = isTx ? autoCmdDialog.enter : true;
   if (idx >= 0 && idx < autoCmds.value.length) {
     if (text === '') autoCmds.value.splice(idx, 1);
-    else autoCmds.value[idx] = { type: autoCmdDialog.type, number, text };
+    else autoCmds.value[idx] = { type: autoCmdDialog.type, number, text, hex, enter };
   }
   if (autoCmds.value.length === 0) autoCmdSelected.value = -1;
   else if (autoCmdSelected.value >= autoCmds.value.length) autoCmdSelected.value = autoCmds.value.length - 1;
@@ -2422,12 +2460,31 @@ const scrollToBottom = () => {
                       :title="`点击切换为 ${autoCmdDialog.type === 'TX' ? 'RX' : 'TX'}`">
                 {{ autoCmdDialog.type }}
               </button>
+              <!-- HEX / 回车：只对 TX 生效；RX 是文本包含匹配，两个开关置灰并回落默认值 -->
+              <div class="flag-col">
+                <div class="flag-row" :class="{ 'is-off': autoCmdDialog.type === 'RX' }">
+                  <span class="flag-label">HEX</span>
+                  <button @click="autoCmdDialog.hex = !autoCmdDialog.hex"
+                          class="switch"
+                          :class="{ 'is-on': autoCmdDialog.hex }"
+                          :disabled="autoCmdDialog.type === 'RX'"
+                          :title="autoCmdDialog.type === 'RX' ? 'RX 是文本匹配，不支持 HEX' : (autoCmdDialog.hex ? '点击改为关' : '点击改为开')"><span class="switch-knob"></span><span class="switch-text">{{ autoCmdDialog.hex ? '开' : '关' }}</span></button>
+                </div>
+                <div class="flag-row" :class="{ 'is-off': autoCmdDialog.type === 'RX' }">
+                  <span class="flag-label">回车</span>
+                  <button @click="autoCmdDialog.enter = !autoCmdDialog.enter"
+                          class="switch"
+                          :class="{ 'is-on': autoCmdDialog.enter }"
+                          :disabled="autoCmdDialog.type === 'RX'"
+                          :title="autoCmdDialog.type === 'RX' ? 'RX 是文本匹配，不发送数据' : (autoCmdDialog.enter ? '点击改为关' : '点击改为开')"><span class="switch-knob"></span><span class="switch-text">{{ autoCmdDialog.enter ? '开' : '关' }}</span></button>
+                </div>
+              </div>
               <textarea v-model="autoCmdDialog.text" rows="3" ref="autoCmdInputRef"
                         class="field field--area mono"
                         placeholder="输入一条命令，例如 AT+RST"
                         @keydown.ctrl.enter.prevent="confirmAutoCmdDialog"
                         @keydown.enter.stop></textarea>
-              <!-- 行尾数字：与命令一起在这里编辑，固定两位（00 ~ 99），超过两位提示有误 -->
+              <!-- 行尾数字 = 这条命令之后的延时：固定两位（00 ~ 99），超过两位提示有误 -->
               <div class="num-col">
                 <input ref="autoCmdNumberRef"
                        :value="autoCmdDialog.numberText"
@@ -2435,13 +2492,19 @@ const scrollToBottom = () => {
                        class="field mono num-input"
                        :class="autoCmdDialog.numberError ? 'is-error' : ''"
                        placeholder="00"
-                       title="行尾数字，两位（00 ~ 99）"
+                       title="延时秒数，两位（00 ~ 99）"
                        @input="onCmdNumberInput"
                        @keydown.enter.prevent="onCmdNumberEnter" />
-                <span class="num-label">数字</span>
+                <span class="num-label">延时</span>
               </div>
             </div>
 
+            <!-- HEX 预览：按字节还原成 AA BB CC；内容非法时改显示错误并禁止保存 -->
+            <p v-if="hexInvalid" class="err-line">不是合法的十六进制</p>
+            <p v-else-if="hexChecked" class="hex-preview">
+              <span class="hex-preview-cap">发送字节</span>
+              <span class="mono">{{ hexPreview.bytes || '（空）' }}</span>
+            </p>
             <p v-if="autoCmdDialog.numberError" class="err-line">{{ autoCmdDialog.numberError }}</p>
 
             <!-- 功能键插入条：点一下就把标记插到光标处，发送时由后端换成实际按键字节 -->
@@ -2453,13 +2516,13 @@ const scrollToBottom = () => {
                       :title="k.tip">{{ k.label }}</button>
             </div>
 
-            <p class="hint-line">点左侧标志可在 TX / RX 之间切换；数字只能两位（00 ~ 99）；Ctrl + Enter 保存；清空内容后保存会删除这一条。</p>
-            <p class="hint-line">功能键标记会原样保存在命令里（如 <span class="mono">AT+RST{ENTER}{UP}</span>），发送时替换成实际按键；末尾没有 {ENTER}/{LF} 时 TX 会自动补一个回车；{0x1B} 可发任意单字节。</p>
+            <p class="hint-line">点左侧标志可在 TX / RX 之间切换；「延时」是这条命令之后等待的秒数，只能两位（00 ~ 99）；Ctrl + Enter 保存；清空内容后保存会删除这一条。</p>
+            <p class="hint-line">HEX 打开后按空格分隔的十六进制字节发送（如 <span class="mono">AA BB CC</span>，可带 0x），此时功能键标记不生效；回车关掉后 TX 不再自动补 0x0D。功能键标记会原样保存在命令里（如 <span class="mono">AT+RST{ENTER}{UP}</span>），发送时替换成实际按键；末尾没有 {ENTER}/{LF} 时 TX 会自动补一个回车；{0x1B} 可发任意单字节。</p>
           </div>
 
           <div class="modal-foot modal-foot--end">
             <button @click="cancelAutoCmdDialog" class="btn">取消</button>
-            <button @click="confirmAutoCmdDialog" class="btn btn-primary">保存</button>
+            <button @click="confirmAutoCmdDialog" :disabled="hexInvalid" class="btn btn-primary">保存</button>
           </div>
         </div>
       </div>
@@ -3508,7 +3571,7 @@ const scrollToBottom = () => {
   overflow: hidden;
 }
 .modal--number { width: 300px; }
-.modal--cmd { width: 460px; }
+.modal--cmd { width: 540px; }
 .modal--msg { width: 420px; }
 .modal-head {
   flex: none;
@@ -3634,6 +3697,20 @@ const scrollToBottom = () => {
   border: 1px solid color-mix(in srgb, var(--col-error) 26%, transparent);
 }
 .cmd-edit-row { display: flex; align-items: flex-start; gap: 8px; }
+/* 命令弹窗：HEX / 回车两个开关竖排在类型标志右边，RX 时整列置灰 */
+.flag-col { flex: none; display: flex; flex-direction: column; gap: 2px; }
+.flag-row { display: flex; align-items: center; gap: 2px; }
+.flag-label {
+  flex: none;
+  width: 26px;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  color: var(--text-sub);
+}
+.flag-col .switch { flex: none; }
+/* RX 时标签一并淡出，和置灰的开关保持同一层次 */
+.flag-row.is-off { opacity: 0.55; }
 .type-toggle {
   flex: none;
   width: 42px;
@@ -3664,6 +3741,20 @@ const scrollToBottom = () => {
 .num-input { height: 30px; text-align: center; }
 .num-label { font-size: 9px; text-align: center; color: var(--text-sub); }
 .err-line { font-size: 10px; color: var(--col-error); }
+/* HEX 预览行：等宽显示最终发送的字节，和错误行同一位置 */
+.hex-preview {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  background: var(--field);
+  font-size: 10px;
+  color: var(--text-main);
+  word-break: break-all;
+}
+.hex-preview-cap { flex: none; font-size: 9px; color: var(--text-sub); }
 .key-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 2px; }
 .key-label { font-size: 9px; color: var(--text-sub); margin-right: 2px; }
 .key-chip {
