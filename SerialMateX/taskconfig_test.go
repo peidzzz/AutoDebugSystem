@@ -6,7 +6,8 @@ import (
 	"testing"
 )
 
-// TestSavePwrDevicesRoundTrip 验证保存后再读回，4 项信息（含空格分隔的多个十六进制数）保持不变。
+// TestSavePwrDevicesRoundTrip 验证保存后再读回，指令与端口（含空格分隔的多个十六进制数）保持不变；
+// 设备里的串口参数缺键时由解析层补缺省值，期望值同样过一遍 withDefaults。
 func TestSavePwrDevicesRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("SERIALMATEX_PWRDEV_DIR", dir)
@@ -24,11 +25,11 @@ func TestSavePwrDevicesRoundTrip(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("want 2, got %d: %+v", len(got), got)
 	}
-	if got[0] != devices[0] {
-		t.Errorf("device0 mismatch:\n got %+v\nwant %+v", got[0], devices[0])
+	if want := devices[0].withDefaults(); got[0] != want {
+		t.Errorf("device0 mismatch:\n got %+v\nwant %+v", got[0], want)
 	}
-	if got[1] != devices[1] {
-		t.Errorf("device1 mismatch:\n got %+v\nwant %+v", got[1], devices[1])
+	if want := devices[1].withDefaults(); got[1] != want {
+		t.Errorf("device1 mismatch:\n got %+v\nwant %+v", got[1], want)
 	}
 
 	// 文件里应当有可读的 PWR-ON 行
