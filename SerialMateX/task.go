@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -29,6 +30,7 @@ type TaskRunOptions struct {
 type TaskRuntime struct {
 	Running      bool   `json:"running"`      // 是否正在跑
 	Paused       bool   `json:"paused"`       // 是否因异常暂停
+	PausedReason string `json:"pausedReason"` // 暂停原因："abnormal" 表示有命令没跑完；空串表示没暂停
 	Round        int    `json:"round"`        // 当前轮次（从 1 开始，未运行 0）
 	RunCount     int    `json:"runCount"`     // 总轮次
 	NormalCount  int    `json:"normalCount"`  // 正常完成轮次
@@ -47,16 +49,16 @@ type TaskRuntime struct {
 
 // taskEngine 持有运行状态与串口送来的数据。
 type taskEngine struct {
-	mu      sync.Mutex
-	rt      TaskRuntime
-	stopCh  chan struct{}
-	resume  chan struct{}
-	rxBuf   strings.Builder // 最近收到的被测设备数据（用于 RX 匹配）
-	curVal  float64
-	hasCurr bool
-	csvCnt  int
-	logPath string
-	csvPath string
+	mu       sync.Mutex
+	rt       TaskRuntime
+	stopCh   chan struct{}
+	decision chan string     // 异常暂停时的决定："end" 结束任务 / "skip" 跳过本轮
+	rxBuf    strings.Builder // 最近收到的被测设备数据（用于 RX 匹配）
+	curVal   float64
+	hasCurr  bool
+	csvCnt   int
+	logPath  string
+	csvPath  string
 }
 
 // --- 提供给前端的接口 ---
@@ -120,12 +122,29 @@ func (a *App) StartTask(opts TaskRunOptions) string {
 	return ""
 }
 
-// StopTask 请求停止。
+// StopTask 请求停止。异常暂停时任务 goroutine 正卡在等待决定上，所以走与 EndTask
+// 相同的收尾路径（投 "end"），否则它会一直等下去、界面也会留下一个永远跑不完的任务。
 func (a *App) StopTask() string {
 	t := &a.task
 	t.mu.Lock()
 	running := t.rt.Running
-	if running && t.stopCh != nil {
+	paused := t.rt.Paused
+	decision := t.decision
+	t.mu.Unlock()
+	if !running {
+		return "任务未在运行"
+	}
+	if paused && decision != nil {
+		select {
+		case decision <- "end":
+			return ""
+		default:
+		}
+		// 通道里已经有一个决定（连点了两下），或者暂停刚好结束：
+		// 退回普通停止路径，关掉 stopCh 两边都能兜住，这次点击不会丢。
+	}
+	t.mu.Lock()
+	if t.stopCh != nil {
 		select {
 		case <-t.stopCh:
 		default:
@@ -133,27 +152,59 @@ func (a *App) StopTask() string {
 		}
 	}
 	t.mu.Unlock()
-	if !running {
-		return "任务未在运行"
+	return ""
+}
+
+// EndTask 结束整个任务：异常暂停中先掉电，然后不再跑下一轮。
+func (a *App) EndTask() string {
+	if !a.postPauseDecision("end") {
+		return "当前不在异常暂停状态"
 	}
 	return ""
 }
 
-// ResumeTask 解除“异常暂停”。
-func (a *App) ResumeTask() string {
-	t := &a.task
-	t.mu.Lock()
-	paused := t.rt.Paused && t.resume != nil
-	resume := t.resume
-	t.mu.Unlock()
-	if !paused {
-		return "当前没有暂停"
-	}
-	select {
-	case resume <- struct{}{}:
-	default:
+// SkipRound 跳过本轮：掉电、照常走间隔倒计时，然后继续下一轮，但这一轮不计正常次数。
+func (a *App) SkipRound() string {
+	if !a.postPauseDecision("skip") {
+		return "当前不在异常暂停状态"
 	}
 	return ""
+}
+
+// ResumeTask 是 SkipRound 的兼容别名：旧界面的「继续」按钮还在调它。
+func (a *App) ResumeTask() string {
+	if !a.postPauseDecision("skip") {
+		return "当前没有暂停"
+	}
+	return ""
+}
+
+// postPauseDecision 在“异常暂停”中投递一次决定。通道容量只有 1：
+// 连点两次时以最后一次为准（先丢掉还没被取走的旧决定），任务 goroutine 不会卡住。
+func (a *App) postPauseDecision(action string) bool {
+	t := &a.task
+	t.mu.Lock()
+	paused := t.rt.Running && t.rt.Paused
+	decision := t.decision
+	t.mu.Unlock()
+	if !paused || decision == nil {
+		return false
+	}
+	select {
+	case decision <- action:
+		return true
+	default:
+	}
+	select {
+	case <-decision:
+	default:
+	}
+	select {
+	case decision <- action:
+		return true
+	default:
+		return false
+	}
 }
 
 // GetTaskRuntime 返回状态快照（界面每 200ms 轮询一次）。
@@ -184,7 +235,7 @@ func (t *taskEngine) reset(cfg TaskConfig) {
 	t.hasCurr = false
 	t.csvCnt = 0
 	t.stopCh = make(chan struct{})
-	t.resume = make(chan struct{}, 1)
+	t.decision = make(chan string, 1)
 }
 
 func (t *taskEngine) set(fn func(rt *TaskRuntime)) {
@@ -331,6 +382,37 @@ func appendFile(path, text string) {
 	_ = f.Close()
 }
 
+// appendTxLog 把任务发出的一条 TX 命令记进日志：[TX 15:04:05] 正文。
+// 前后各用恰好一个换行夹住：日志里的 RX 数据可能不带换行（甚至什么都还没写），
+// 不加前置换行就会把 TX 行粘在上一段 RX 字节后面。
+func (t *taskEngine) appendTxLog(logPath, text string) {
+	if logPath == "" {
+		return
+	}
+	prefix := ""
+	if last, ok := lastFileByte(logPath); ok && last != '\n' {
+		prefix = "\n"
+	}
+	appendFile(logPath, prefix+"[TX "+time.Now().Format("15:04:05")+"] "+text+"\n")
+}
+
+// lastFileByte 读文件的最后一个字节，用来判断日志是否已经以换行结尾。
+func lastFileByte(path string) (byte, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+	if _, err := f.Seek(-1, io.SeekEnd); err != nil {
+		return 0, false
+	}
+	var b [1]byte
+	if _, err := f.Read(b[:]); err != nil {
+		return 0, false
+	}
+	return b[0], true
+}
+
 // csvAppend 每 0.5 秒写一个采样点：英文逗号分隔，每 50 个换行。
 func (t *taskEngine) csvAppend(path, value string) {
 	t.csvCnt++
@@ -432,6 +514,8 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 	aborted := false
 	// failMsg 记下真正的失败原因（上电/掉电/电源口写入），结束时优先显示它。
 	failMsg := ""
+	// endMsg 记下用户主动“结束任务”，排在 failMsg 之后、完成语之前显示。
+	endMsg := ""
 	var stopCsv func()
 
 	for round := 1; round <= cfg.RunCount; round++ {
@@ -484,14 +568,34 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			break
 		}
 
+		// 异常暂停：等界面给出决定。停止（stopCh）也按“结束任务”处理，
+		// 所以无论用户点结束、跳过还是停止，这个 goroutine 都不会被永久挂住。
+		endRequested := false
+		skipRound := false
 		if !complete && cfg.AbnormalPause {
 			t.set(func(rt *TaskRuntime) {
 				rt.Paused = true
 				rt.Phase = "paused"
+				rt.PausedReason = "abnormal"
 				rt.Message = "有命令未执行完，已暂停（电源保持）"
 			})
-			<-t.resume
-			t.set(func(rt *TaskRuntime) { rt.Paused = false; rt.Message = "" })
+			var action string
+			select {
+			case action = <-t.decision:
+			case <-t.stopCh:
+				action = "end"
+			}
+			t.set(func(rt *TaskRuntime) {
+				rt.Paused = false
+				rt.PausedReason = ""
+				rt.Message = ""
+			})
+			if action == "end" {
+				// 掉电、写停止横幅，然后结束整个任务（不再跑下一轮）。
+				endRequested = true
+			}
+			// action == "skip" 落到下面的掉电 / 间隔流程，只是跳过 NormalCount++。
+			skipRound = action == "skip"
 		}
 
 		// 掉电。写不出去说明电源口已经不可用，再跑下一轮没有意义，直接中止。
@@ -508,11 +612,16 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			stopCsv()
 			stopCsv = nil
 		}
-		if complete && offErr == nil {
+		if complete && offErr == nil && !skipRound {
 			t.set(func(rt *TaskRuntime) { rt.NormalCount++ })
 		}
 		if offErr != nil {
 			aborted = true
+			break
+		}
+		if endRequested {
+			aborted = true
+			endMsg = "已手动结束"
 			break
 		}
 
@@ -540,13 +649,17 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 	}
 	t.set(func(rt *TaskRuntime) {
 		// 中途失败时保留具体原因（上电失败 / 掉电失败 / 电源口写入失败），不要被完成语覆盖掉。
-		if failMsg != "" {
+		switch {
+		case failMsg != "":
 			rt.Message = failMsg
-		} else {
+		case endMsg != "":
+			rt.Message = endMsg
+		default:
 			rt.Message = msg
 		}
 		rt.Running = false
 		rt.Paused = false
+		rt.PausedReason = ""
 		rt.Phase = "done"
 		rt.PowerOn = false
 		rt.Countdown = 0
@@ -586,10 +699,18 @@ func (a *App) runCommands(cmds []AutoCmd, deadline time.Time) bool {
 				t.set(func(rt *TaskRuntime) { rt.Message = fmt.Sprintf("第 %d 条命令编码失败：%v", i+1, encErr) })
 				return false
 			}
-			if res := a.taskSend(string(payload)); strings.HasPrefix(res, "Error") || strings.HasPrefix(res, "Send") {
+			text := string(payload)
+			if res := a.taskSend(text); strings.HasPrefix(res, "Error") || strings.HasPrefix(res, "Send") {
 				t.set(func(rt *TaskRuntime) { rt.Message = "发送失败：" + res })
 				return false
 			}
+			// 发送成功才记录：日志里留一行 [TX 时:分:秒] 正文，同时推给界面高亮显示。
+			// 两边用同一个字符串（编码后真正发出去的文本），界面看到的就是设备收到的内容。
+			t.mu.Lock()
+			logPath := t.logPath
+			t.mu.Unlock()
+			t.appendTxLog(logPath, text)
+			a.emitTaskTx(text)
 		}
 
 		// 执行完成后高亮数字并倒计时。

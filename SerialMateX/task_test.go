@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -279,6 +280,25 @@ func waitTaskDone(t *testing.T, app *App, timeout time.Duration) TaskRuntime {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("任务没有在 %v 内结束", timeout)
+	return TaskRuntime{}
+}
+
+// waitTaskPaused 等任务进入异常暂停；返回暂停时的状态快照。
+// 命令里放一条永不匹配的 RX，这一轮就必然走“有命令未执行完”的暂停分支。
+func waitTaskPaused(t *testing.T, app *App, timeout time.Duration) TaskRuntime {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		rt := app.GetTaskRuntime()
+		if rt.Paused {
+			return rt
+		}
+		if !rt.Running {
+			t.Fatalf("任务在进入异常暂停前就结束了: %+v", rt)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("任务没有在 %v 内进入异常暂停: %+v", timeout, app.GetTaskRuntime())
 	return TaskRuntime{}
 }
 
@@ -619,6 +639,217 @@ func TestTaskClosesPwrPortWhenStopped(t *testing.T) {
 	}
 	waitTaskDone(t, app, 10*time.Second)
 	waitPwrClosed(t, port)
+}
+
+// TestTaskPauseEndTask 异常暂停中点「结束任务」：先掉电，再结束整个任务（不再跑下一轮）。
+func TestTaskPauseEndTask(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=1\nWaitSeconds=1\nDelaySeconds=0\nRunCount=2\n",
+		"RX never 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	// 没暂停时不能悄悄成功。
+	if msg := app.EndTask(); !strings.Contains(msg, "当前不在异常暂停状态") {
+		t.Fatalf("未暂停时结束任务的提示不对: %q", msg)
+	}
+
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	if rt := waitTaskPaused(t, app, 10*time.Second); rt.PausedReason != "abnormal" {
+		t.Fatalf("暂停原因应为 abnormal: %q", rt.PausedReason)
+	}
+	if msg := app.EndTask(); msg != "" {
+		t.Fatalf("结束任务失败: %s", msg)
+	}
+
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if rt.NormalCount != 0 {
+		t.Fatalf("被结束的那一轮不能算正常: normal=%d", rt.NormalCount)
+	}
+	if rt.Round != 1 {
+		t.Fatalf("结束任务后不能再进下一轮: round=%d", rt.Round)
+	}
+	if !strings.Contains(rt.Message, "已手动结束") {
+		t.Fatalf("结束原因不对: %q", rt.Message)
+	}
+	waitPwrClosed(t, port)
+
+	// 上电 → 结束任务时掉电
+	writes := port.written()
+	want := [][]byte{{0x01}, {0x00}}
+	if len(writes) != len(want) {
+		t.Fatalf("电源写入次数不对: %q", writes)
+	}
+	for i := range want {
+		if !bytes.Equal(writes[i], want[i]) {
+			t.Fatalf("电源写入不对: %q", writes)
+		}
+	}
+}
+
+// TestTaskPauseSkipRound 异常暂停中点「跳过本轮」：掉电、照常等间隔，然后跑下一轮，
+// 但这一轮不计入正常次数。
+func TestTaskPauseSkipRound(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=1\nWaitSeconds=1\nDelaySeconds=1\nRunCount=2\n",
+		"RX never 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	if rt := waitTaskPaused(t, app, 10*time.Second); rt.Round != 1 {
+		t.Fatalf("应在第 1 轮暂停: round=%d", rt.Round)
+	}
+	if msg := app.SkipRound(); msg != "" {
+		t.Fatalf("跳过本轮失败: %s", msg)
+	}
+
+	// 第二轮才喂数据，让这一轮正常跑完（第一轮的命令永远匹配不到）。
+	stopFeed := make(chan struct{})
+	defer close(stopFeed)
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopFeed:
+				return
+			case <-ticker.C:
+				app.task.feed([]byte("never\r\n"))
+			}
+		}
+	}()
+
+	rt := waitTaskDone(t, app, 20*time.Second)
+	if rt.Round != 2 {
+		t.Fatalf("跳过本轮后应继续第 2 轮: round=%d", rt.Round)
+	}
+	if rt.NormalCount != 1 {
+		t.Fatalf("被跳过的那轮不能算正常: normal=%d msg=%s", rt.NormalCount, rt.Message)
+	}
+	waitPwrClosed(t, port)
+
+	// 上电 → 跳过时掉电 → 下一轮上电 → 掉电
+	writes := port.written()
+	want := [][]byte{{0x01}, {0x00}, {0x01}, {0x00}}
+	if len(writes) != len(want) {
+		t.Fatalf("电源写入次数不对: %q", writes)
+	}
+	for i := range want {
+		if !bytes.Equal(writes[i], want[i]) {
+			t.Fatalf("电源写入不对: %q", writes)
+		}
+	}
+}
+
+// TestTaskPauseStopDoesNotHang 异常暂停中按「停止」必须能结束任务。
+// 旧实现停在裸 <-t.resume 上，这个测试会一直等到 waitTaskDone 超时。
+func TestTaskPauseStopDoesNotHang(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=1\nWaitSeconds=1\nDelaySeconds=0\nRunCount=2\n",
+		"RX never 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	waitTaskPaused(t, app, 10*time.Second)
+
+	if msg := app.StopTask(); msg != "" {
+		t.Fatalf("暂停中停止失败: %s", msg)
+	}
+
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if rt.NormalCount != 0 {
+		t.Fatalf("没跑完的一轮不能算正常: normal=%d", rt.NormalCount)
+	}
+	if !strings.Contains(rt.Message, "已手动结束") {
+		t.Fatalf("暂停中停止应与结束任务同一条路径: %q", rt.Message)
+	}
+	waitPwrClosed(t, port)
+}
+
+// TestTaskTxLogLine 任务发出的每条命令都要在日志里留一行 “[TX 时:分:秒] 正文”，
+// 并且前后各恰好一个换行：RX 数据不带换行时 TX 行也不能粘在它后面。
+func TestTaskTxLogLine(t *testing.T) {
+	writeTaskFixtures(t,
+		"[Task]\nSaveLog=1\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=3\nDelaySeconds=0\nRunCount=1\n",
+		"RX ready 01\nTX AT+OK 00 enter=0\nTX AT+OK2 00 enter=0\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	taskSendHook = func(string) string { return "Sent" }
+	defer func() { taskSendHook = nil }()
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+
+	// 只喂一次，且刻意不带换行；RX 命令自带 1 秒延时，保证这段数据先落进日志。
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		app.task.feed([]byte("ready"))
+	}()
+
+	rt := waitTaskDone(t, app, 20*time.Second)
+	if rt.NormalCount != 1 {
+		t.Fatalf("一轮应算正常: normal=%d msg=%s", rt.NormalCount, rt.Message)
+	}
+
+	dir := os.Getenv("SERIALMATEX_LOGDIR")
+	logs, err := filepath.Glob(filepath.Join(dir, "DEBUGLOG_*.log"))
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("应生成 1 个日志文件: %v %v", logs, err)
+	}
+	raw, err := os.ReadFile(logs[0])
+	if err != nil {
+		t.Fatalf("读日志失败: %v", err)
+	}
+	text := string(raw)
+
+	// 逐行检查：每行 TX 前面恰好一个换行（不粘 RX 数据、也不空行），行尾紧跟换行。
+	txLineRe := regexp.MustCompile(`^\[TX \d{2}:\d{2}:\d{2}\] \S+$`)
+	var lines []string
+	from := 0
+	for {
+		idx := strings.Index(text[from:], "[TX ")
+		if idx < 0 {
+			break
+		}
+		idx += from
+		if idx == 0 || text[idx-1] != '\n' {
+			t.Fatalf("第 %d 行 TX 前面没有换行（粘在上一段内容后面了）: %q", len(lines)+1, text)
+		}
+		if idx >= 2 && text[idx-2] == '\n' {
+			t.Fatalf("第 %d 行 TX 前面多了一个换行: %q", len(lines)+1, text)
+		}
+		nl := strings.IndexByte(text[idx:], '\n')
+		if nl < 0 {
+			t.Fatalf("第 %d 行 TX 后面没有换行: %q", len(lines)+1, text)
+		}
+		line := text[idx : idx+nl]
+		if !txLineRe.MatchString(line) {
+			t.Fatalf("TX 行格式不对: %q", line)
+		}
+		lines = append(lines, line)
+		from = idx + nl + 1
+	}
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], " AT+OK") || !strings.HasSuffix(lines[1], " AT+OK2") {
+		t.Fatalf("日志里的 TX 行内容/顺序不对: %q\n%s", lines, text)
+	}
+	// RX 数据确实紧挨着第一行 TX，中间只隔一个换行。
+	if !strings.HasSuffix(text[:strings.Index(text, lines[0])], "ready\n") {
+		t.Fatalf("RX 数据与 TX 行之间不是恰好一个换行: %q", text)
+	}
 }
 
 // TestTaskAbortsWhenPwrWriteFails 电源口写入失败必须中止任务，并把原因留在 Message 里。

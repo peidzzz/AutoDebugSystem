@@ -70,6 +70,18 @@ func (a *App) startup(ctx context.Context) {
 	a.ensureAutoCmdFile()
 }
 
+// emitTaskTx 把任务刚发出的一条 TX 命令推给界面，RX MONITOR 据此另起一行高亮显示。
+// 日志与事件用同一个字符串；没有 Wails 上下文时（比如单元测试）只记日志、不推事件。
+func (a *App) emitTaskTx(text string) {
+	if a.ctx == nil {
+		return
+	}
+	runtime.EventsEmit(a.ctx, "task-tx", map[string]string{
+		"text": text,
+		"time": time.Now().Format("15:04:05"),
+	})
+}
+
 // 1. 获取串口列表
 func (a *App) GetSerialPorts() ([]string, error) {
 	ports, err := serial.GetPortsList()
