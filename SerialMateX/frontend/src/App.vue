@@ -97,9 +97,72 @@ const udpLocalPort = ref('8081');
 interface PwrDevice {
   name: string;
   port: string;
+  baud: number;
+  dataBits: number;
+  stopBits: number; // 内部值：1 / 15 / 2（15 表示 1.5）
+  parity: string;
   powerOn: string;
   powerOff: string;
+  powerOnHex: boolean;
+  powerOnEnter: boolean;
+  powerOffHex: boolean;
+  powerOffEnter: boolean;
 }
+
+// 新建设备时的缺省值（与 Go 侧 withDefaults() 对齐）
+const emptyDeviceDraft = (): PwrDevice => ({
+  name: '',
+  port: '',
+  baud: 9600,
+  dataBits: 8,
+  stopBits: 1,
+  parity: 'None',
+  powerOn: '',
+  powerOff: '',
+  powerOnHex: true,
+  powerOnEnter: false,
+  powerOffHex: true,
+  powerOffEnter: false
+});
+
+// 停止位内部值归一化：1 / 1.5 / 15 / 2 → 1 / 15 / 2
+const normalizeStopBits = (v: unknown): number => {
+  const n = Number(v);
+  if (n === 2) return 2;
+  if (n === 15 || n === 1.5) return 15;
+  return 1;
+};
+
+// 设备弹窗里的串口参数下拉：同时只允许打开一个，键为 `行号:参数名`
+const deviceMenu = ref('');
+const toggleDeviceMenu = (key: string) => {
+  deviceMenu.value = deviceMenu.value === key ? '' : key;
+};
+const deviceBaudOptions = [4800, 9600, 14400, 19200, 38400, 57600, 115200, 128000, 230400, 256000, 460800, 921600];
+const deviceStopBitsOptions = [
+  { label: '1', value: 1 },
+  { label: '1.5', value: 15 },
+  { label: '2', value: 2 }
+];
+const deviceStopBitsLabel = (v: number) =>
+  deviceStopBitsOptions.find(opt => opt.value === v)?.label ?? String(v);
+
+// 老配置或尚未实现的 ini 键会让字段缺失：统一补齐缺省值，避免界面出现 undefined
+const withDeviceDefaults = (d: Partial<PwrDevice>): PwrDevice => ({
+  name: d.name ?? '',
+  port: d.port ?? '',
+  baud: Number(d.baud) > 0 ? Number(d.baud) : 9600,
+  dataBits: Number(d.dataBits) > 0 ? Number(d.dataBits) : 8,
+  stopBits: normalizeStopBits(d.stopBits),
+  parity: d.parity || 'None',
+  powerOn: d.powerOn ?? '',
+  powerOff: d.powerOff ?? '',
+  powerOnHex: d.powerOnHex !== false,
+  powerOnEnter: d.powerOnEnter === true,
+  powerOffHex: d.powerOffHex !== false,
+  powerOffEnter: d.powerOffEnter === true
+});
+
 const pwrDevices = ref<PwrDevice[]>([]);
 const selectedDeviceName = ref('');
 const pwrDevPath = ref('');
@@ -111,7 +174,7 @@ const selectedDevice = computed(
 const loadPwrDevices = async () => {
   try {
     const list = await GetPwrDevices();
-    pwrDevices.value = (list ?? []) as unknown as PwrDevice[];
+    pwrDevices.value = (list ?? []).map(d => withDeviceDefaults(d as unknown as Partial<PwrDevice>));
     pwrDevPath.value = await GetPwrDevPath();
     if (pwrDevices.value.length > 0 && !pwrDevices.value.some(d => d.name === selectedDeviceName.value)) {
       selectedDeviceName.value = pwrDevices.value[0].name;
@@ -130,8 +193,9 @@ const deviceSaving = ref(false);
 
 const openDeviceEditor = () => {
   deviceDraft.value = pwrDevices.value.map(d => ({ ...d }));
+  deviceMenu.value = '';
   if (deviceDraft.value.length === 0) {
-    deviceDraft.value = [{ name: '', port: '', powerOn: '', powerOff: '' }];
+    deviceDraft.value = [emptyDeviceDraft()];
   }
   // 弹窗里的“当前选中”与设备选择框保持一致
   const idx = deviceDraft.value.findIndex(d => d.name === selectedDeviceName.value);
@@ -141,7 +205,7 @@ const openDeviceEditor = () => {
 };
 
 const addDeviceDraft = () => {
-  deviceDraft.value.push({ name: '', port: '', powerOn: '', powerOff: '' });
+  deviceDraft.value.push(emptyDeviceDraft());
   deviceDraftIndex.value = deviceDraft.value.length - 1;
   deviceEditorError.value = '';
 };
@@ -149,8 +213,9 @@ const addDeviceDraft = () => {
 const removeDeviceDraft = () => {
   if (deviceDraft.value.length === 0) return;
   deviceDraft.value.splice(deviceDraftIndex.value, 1);
+  deviceMenu.value = '';
   if (deviceDraft.value.length === 0) {
-    deviceDraft.value = [{ name: '', port: '', powerOn: '', powerOff: '' }];
+    deviceDraft.value = [emptyDeviceDraft()];
     deviceDraftIndex.value = 0;
   } else if (deviceDraftIndex.value >= deviceDraft.value.length) {
     deviceDraftIndex.value = deviceDraft.value.length - 1;
@@ -186,15 +251,15 @@ const saveDeviceEditor = async () => {
       return;
     }
     names.add(name);
-    if (!isHexTokenList(row.powerOn)) {
+    if (row.powerOnHex && !isHexTokenList(row.powerOn)) {
       deviceEditorError.value = `${name} 的 PWR-ON 只能是十六进制数（多个用空格分隔），如 0x01 0x02 AA`;
       return;
     }
-    if (!isHexTokenList(row.powerOff)) {
+    if (row.powerOffHex && !isHexTokenList(row.powerOff)) {
       deviceEditorError.value = `${name} 的 PWR-OFF 只能是十六进制数（多个用空格分隔），如 0xAA 0x00`;
       return;
     }
-    list.push({ name, port, powerOn: row.powerOn.trim(), powerOff: row.powerOff.trim() });
+    list.push(withDeviceDefaults({ ...row, name, port, powerOn: row.powerOn.trim(), powerOff: row.powerOff.trim() }));
   }
 
   deviceSaving.value = true;
@@ -2189,8 +2254,110 @@ const scrollToBottom = () => {
               <div class="draft-grid">
                 <label class="draft-cell"><span class="draft-label">名称</span><input v-model="row.name" placeholder="设备名称" class="field" /></label>
                 <label class="draft-cell"><span class="draft-label">端口</span><input v-model="row.port" placeholder="COM 端口，如 COM7" class="field mono" /></label>
-                <label class="draft-cell"><span class="draft-label">上电</span><input v-model="row.powerOn" placeholder="PWR-ON，如 0x01 0x02" class="field mono" /></label>
-                <label class="draft-cell"><span class="draft-label">掉电</span><input v-model="row.powerOff" placeholder="PWR-OFF，如 0xAA 0x00" class="field mono" /></label>
+
+                <div class="draft-cell">
+                  <span class="draft-label">波特率</span>
+                  <div class="field-wrap">
+                    <button @click="toggleDeviceMenu(idx + ':baud')" class="field field--btn">
+                      <span>{{ row.baud }}</span>
+                      <svg class="chev" :class="{ 'is-open': deviceMenu === idx + ':baud' }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                    </button>
+                    <div v-if="deviceMenu === idx + ':baud'" @click="deviceMenu = ''" class="fixed inset-0 z-0 cursor-default"></div>
+                    <Transition name="slide-fade">
+                      <div v-if="deviceMenu === idx + ':baud'" class="menu">
+                        <button v-for="opt in deviceBaudOptions" :key="opt" @click="row.baud = opt; deviceMenu = ''" class="menu-item" :class="{ 'is-on': row.baud === opt }">
+                          <span>{{ opt }}</span>
+                          <span v-if="row.baud === opt" class="menu-tick">✓</span>
+                        </button>
+                      </div>
+                    </Transition>
+                  </div>
+                </div>
+
+                <div class="draft-cell">
+                  <span class="draft-label">数据位</span>
+                  <div class="field-wrap">
+                    <button @click="toggleDeviceMenu(idx + ':dataBits')" class="field field--btn">
+                      <span>{{ row.dataBits }}</span>
+                      <svg class="chev" :class="{ 'is-open': deviceMenu === idx + ':dataBits' }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                    </button>
+                    <div v-if="deviceMenu === idx + ':dataBits'" @click="deviceMenu = ''" class="fixed inset-0 z-0 cursor-default"></div>
+                    <Transition name="slide-fade">
+                      <div v-if="deviceMenu === idx + ':dataBits'" class="menu">
+                        <button v-for="opt in dataBitsOptions" :key="opt" @click="row.dataBits = opt; deviceMenu = ''" class="menu-item" :class="{ 'is-on': row.dataBits === opt }">
+                          <span>{{ opt }}</span>
+                          <span v-if="row.dataBits === opt" class="menu-tick">✓</span>
+                        </button>
+                      </div>
+                    </Transition>
+                  </div>
+                </div>
+
+                <div class="draft-cell">
+                  <span class="draft-label">停止位</span>
+                  <div class="field-wrap">
+                    <button @click="toggleDeviceMenu(idx + ':stopBits')" class="field field--btn">
+                      <span>{{ deviceStopBitsLabel(row.stopBits) }}</span>
+                      <svg class="chev" :class="{ 'is-open': deviceMenu === idx + ':stopBits' }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                    </button>
+                    <div v-if="deviceMenu === idx + ':stopBits'" @click="deviceMenu = ''" class="fixed inset-0 z-0 cursor-default"></div>
+                    <Transition name="slide-fade">
+                      <div v-if="deviceMenu === idx + ':stopBits'" class="menu">
+                        <button v-for="opt in deviceStopBitsOptions" :key="opt.value" @click="row.stopBits = opt.value; deviceMenu = ''" class="menu-item" :class="{ 'is-on': row.stopBits === opt.value }">
+                          <span>{{ opt.label }}</span>
+                          <span v-if="row.stopBits === opt.value" class="menu-tick">✓</span>
+                        </button>
+                      </div>
+                    </Transition>
+                  </div>
+                </div>
+
+                <div class="draft-cell">
+                  <span class="draft-label">校验位</span>
+                  <div class="field-wrap">
+                    <button @click="toggleDeviceMenu(idx + ':parity')" class="field field--btn">
+                      <span>{{ row.parity }}</span>
+                      <svg class="chev" :class="{ 'is-open': deviceMenu === idx + ':parity' }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                    </button>
+                    <div v-if="deviceMenu === idx + ':parity'" @click="deviceMenu = ''" class="fixed inset-0 z-0 cursor-default"></div>
+                    <Transition name="slide-fade">
+                      <div v-if="deviceMenu === idx + ':parity'" class="menu">
+                        <button v-for="opt in parityOptions" :key="opt.value" @click="row.parity = opt.value; deviceMenu = ''" class="menu-item" :class="{ 'is-on': row.parity === opt.value }">
+                          <span>{{ opt.label }}</span>
+                          <span v-if="row.parity === opt.value" class="menu-tick">✓</span>
+                        </button>
+                      </div>
+                    </Transition>
+                  </div>
+                </div>
+
+                <div class="draft-cell draft-cell--full">
+                  <div class="draft-cmd-head">
+                    <span class="draft-label">上电</span>
+                    <span v-if="row.powerOnHex" class="draft-hint">空格分隔的十六进制</span>
+                  </div>
+                  <div class="draft-cmd-line">
+                    <input v-model="row.powerOn" placeholder="PWR-ON，如 0x01 0x02" class="field mono" />
+                    <span class="draft-cap">HEX</span>
+                    <button @click="row.powerOnHex = !row.powerOnHex" class="switch" :class="{ 'is-on': row.powerOnHex }" :title="row.powerOnHex ? '点击改为关' : '点击改为开'"><span class="switch-knob"></span><span class="switch-text">{{ row.powerOnHex ? '开' : '关' }}</span></button>
+                    <span class="draft-cap">回车</span>
+                    <button @click="row.powerOnEnter = !row.powerOnEnter" class="switch" :class="{ 'is-on': row.powerOnEnter }" :title="row.powerOnEnter ? '点击改为关' : '点击改为开'"><span class="switch-knob"></span><span class="switch-text">{{ row.powerOnEnter ? '开' : '关' }}</span></button>
+                  </div>
+                </div>
+
+                <div class="draft-cell draft-cell--full">
+                  <div class="draft-cmd-head">
+                    <span class="draft-label">掉电</span>
+                    <span v-if="row.powerOffHex" class="draft-hint">空格分隔的十六进制</span>
+                  </div>
+                  <div class="draft-cmd-line">
+                    <input v-model="row.powerOff" placeholder="PWR-OFF，如 0xAA 0x00" class="field mono" />
+                    <span class="draft-cap">HEX</span>
+                    <button @click="row.powerOffHex = !row.powerOffHex" class="switch" :class="{ 'is-on': row.powerOffHex }" :title="row.powerOffHex ? '点击改为关' : '点击改为开'"><span class="switch-knob"></span><span class="switch-text">{{ row.powerOffHex ? '开' : '关' }}</span></button>
+                    <span class="draft-cap">回车</span>
+                    <button @click="row.powerOffEnter = !row.powerOffEnter" class="switch" :class="{ 'is-on': row.powerOffEnter }" :title="row.powerOffEnter ? '点击改为关' : '点击改为开'"><span class="switch-knob"></span><span class="switch-text">{{ row.powerOffEnter ? '开' : '关' }}</span></button>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -3442,6 +3609,22 @@ const scrollToBottom = () => {
   color: var(--text-sub);
   padding-left: 2px;
 }
+/* 设备弹窗：8 项排布（4 个串口参数 + 上电/掉电各带 HEX/回车开关） */
+.modal--devices { max-height: calc(100vh - 96px); }
+.modal--devices .modal-body { overflow: auto; }
+.draft-cell--full { grid-column: 1 / -1; }
+.draft-cmd-head { display: flex; align-items: center; gap: 6px; }
+.draft-hint { font-size: 9.5px; color: var(--text-sub); opacity: 0.8; }
+.draft-cmd-line { display: flex; align-items: center; gap: 6px; }
+.draft-cmd-line .field { flex: 1 1 auto; width: auto; min-width: 0; }
+.draft-cap {
+  flex: none;
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  color: var(--text-sub);
+}
+.draft-cmd-line .switch { flex: none; }
 .alert {
   font-size: 10.5px;
   padding: 6px 8px;
