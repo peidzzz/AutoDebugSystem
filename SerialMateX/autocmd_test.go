@@ -165,11 +165,13 @@ func TestAutoCmdKeywordsParse(t *testing.T) {
 	}
 }
 
-// RX 行是文本包含匹配：hex= / enter= 对它没有意义，两个开关必须取默认值。
+// RX 行是文本包含匹配：行尾的 hex= / enter= 要被吞掉（不能留在匹配文本里，也不能破坏行尾延时数字），
+// 但开关必须钉回默认值（Hex=false、Enter=true）。
 func TestAutoCmdRxIgnoresKeywords(t *testing.T) {
 	got := parseAutoCmdLine("RX ready 05 hex=1 enter=0")
-	if got.Hex || !got.Enter {
-		t.Fatalf("RX 行必须忽略 hex=/enter=，得到 %#v", got)
+	want := AutoCmd{Type: "RX", Number: 5, Text: "ready", Hex: false, Enter: true}
+	if got != want {
+		t.Fatalf("RX 行应吞掉关键字并保持默认开关：parseAutoCmdLine 得到 %#v, 期望 %#v", got, want)
 	}
 }
 

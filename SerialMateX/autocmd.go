@@ -95,7 +95,7 @@ func (a *App) GetAutoCmds() []AutoCmd {
 }
 
 // parseAutoCmdLine 解析一行 “TX AT+RST 00” / “RX ready 05”；没有前缀时按 TX 处理。
-// TX 行尾的 hex=1 / enter=0 关键字会先被削掉（RX 行不认关键字），再按行尾数字取延时；
+// 行尾的 hex=1 / enter=0 关键字会先被削掉（RX 行同样吞掉、但不生效），再按行尾数字取延时；
 // 数字拆不出来时数字为 0，关键字缺省为 Hex=false、Enter=true。
 // 另外兼容第 34 轮 “TX 0 AT+RST”（数字紧跟在类型后面）的写法。
 func parseAutoCmdLine(line string) AutoCmd {
@@ -111,16 +111,16 @@ func parseAutoCmdLine(line string) AutoCmd {
 	return parseAutoCmdBody("TX", line)
 }
 
-// parseAutoCmdBody 按类型解析 “命令文本 [数字]”：TX 先削掉行尾关键字并把两个开关填好，
-// RX 是文本包含匹配，hex= / enter= 对它没有意义，开关取缺省值。
+// parseAutoCmdBody 按类型解析 “命令文本 [数字]”：TX / RX 都先削掉行尾的 hex= / enter= 关键字。
+// RX 是文本包含匹配：关键字要被吞掉（否则会留在匹配文本里、还会拆丢行尾延时数字），
+// 但不许改变行为，两个开关一律钉回缺省值 Hex=false、Enter=true。
 func parseAutoCmdBody(tag, rest string) AutoCmd {
-	if tag == "RX" {
-		cmd := mkat(tag, rest)
-		cmd.Enter = true
-		return cmd
-	}
 	body, asHex, withEnter := splitAutoCmdKeywords(rest)
 	cmd := mkat(tag, body)
+	if tag == "RX" {
+		cmd.Hex, cmd.Enter = false, true
+		return cmd
+	}
 	cmd.Hex, cmd.Enter = asHex, withEnter
 	return cmd
 }
