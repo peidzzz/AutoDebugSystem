@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -22,10 +23,10 @@ func TestAutoCmdRoundTrip(t *testing.T) {
 	}
 
 	want := []AutoCmd{
-		{Type: "TX", Number: 0, Text: "AT+RST"},
-		{Type: "RX", Number: 5, Text: "ready"},
-		{Type: "TX", Number: 12, Text: "AT+BAUD=115200"},
-		{Type: "RX", Number: 99, Text: "OK"},
+		{Type: "TX", Number: 0, Text: "AT+RST", Enter: true},
+		{Type: "RX", Number: 5, Text: "ready", Enter: true},
+		{Type: "TX", Number: 12, Text: "AT+BAUD=115200", Enter: true},
+		{Type: "RX", Number: 99, Text: "OK", Enter: true},
 	}
 	if err := app.SaveAutoCmds(want); err != nil {
 		t.Fatalf("保存失败: %v", err)
@@ -36,22 +37,22 @@ func TestAutoCmdRoundTrip(t *testing.T) {
 
 	// 换行会被压平，空行被丢弃
 	if err := app.SaveAutoCmds([]AutoCmd{
-		{Type: "TX", Number: 3, Text: "a"},
-		{Type: "RX", Number: 0, Text: "b\nc"},
+		{Type: "TX", Number: 3, Text: "a", Enter: true},
+		{Type: "RX", Number: 0, Text: "b\nc", Enter: true},
 		{Type: "TX", Number: 0, Text: ""},
 		{Type: "RX", Number: 0, Text: "   "},
 	}); err != nil {
 		t.Fatalf("保存失败: %v", err)
 	}
 	if got := app.GetAutoCmds(); !reflect.DeepEqual(got, []AutoCmd{
-		{Type: "TX", Number: 3, Text: "a"},
-		{Type: "RX", Number: 0, Text: "b c"},
+		{Type: "TX", Number: 3, Text: "a", Enter: true},
+		{Type: "RX", Number: 0, Text: "b c", Enter: true},
 	}) {
 		t.Fatalf("换行/空行处理错误: %#v", got)
 	}
 
 	// 非法 Type 写盘时回落为 TX；负数夹紧为 0；超过两位夹紧为 99
-	if err := app.SaveAutoCmds([]AutoCmd{{Type: "XX", Number: -5, Text: "ping"}}); err != nil {
+	if err := app.SaveAutoCmds([]AutoCmd{{Type: "XX", Number: -5, Text: "ping", Enter: true}}); err != nil {
 		t.Fatalf("保存失败: %v", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, autoCmdFileName))
@@ -84,11 +85,11 @@ func TestAutoCmdsSkipComments(t *testing.T) {
 	}
 	app := &App{}
 	want := []AutoCmd{
-		{Type: "TX", Number: 0, Text: "AT"}, // 没有前缀的老格式按 TX 处理
-		{Type: "RX", Number: 0, Text: "hello world"},
-		{Type: "TX", Number: 0, Text: "AT+TEST"},
-		{Type: "TX", Number: 42, Text: "AT+DELAY"}, // 数字在行尾
-		{Type: "TX", Number: 7, Text: "AT+LEGACY"}, // 旧格式：数字紧跟类型
+		{Type: "TX", Number: 0, Text: "AT", Enter: true}, // 没有前缀的老格式按 TX 处理
+		{Type: "RX", Number: 0, Text: "hello world", Enter: true},
+		{Type: "TX", Number: 0, Text: "AT+TEST", Enter: true},
+		{Type: "TX", Number: 42, Text: "AT+DELAY", Enter: true}, // 数字在行尾
+		{Type: "TX", Number: 7, Text: "AT+LEGACY", Enter: true}, // 旧格式：数字紧跟类型
 	}
 	if got := app.GetAutoCmds(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("注释/前缀/数字解析错误: %#v", got)
@@ -104,7 +105,7 @@ func TestAutoCmdNumericText(t *testing.T) {
 		t.Fatal(err)
 	}
 	app := &App{}
-	want := []AutoCmd{{Type: "TX", Number: 0, Text: "123"}}
+	want := []AutoCmd{{Type: "TX", Number: 0, Text: "123", Enter: true}}
 	if got := app.GetAutoCmds(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("纯数字命令解析错误: %#v", got)
 	}
@@ -121,11 +122,151 @@ func TestAutoCmdTextKeepsInnerNumbers(t *testing.T) {
 	}
 	app := &App{}
 	want := []AutoCmd{
-		{Type: "TX", Number: 3, Text: "AT+BAUD=115200"},
-		{Type: "RX", Number: 8, Text: "ADC=12 7"},
+		{Type: "TX", Number: 3, Text: "AT+BAUD=115200", Enter: true},
+		{Type: "RX", Number: 8, Text: "ADC=12 7", Enter: true},
 	}
 	if got := app.GetAutoCmds(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("命令内数字被误拆: %#v", got)
+	}
+}
+
+// parseAutoCmdLine 要按行尾的 hex= / enter= 关键字填充两个开关，缺省为 false / true。
+func TestAutoCmdKeywordsParse(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want AutoCmd
+	}{
+		{
+			name: "老行：默认不 HEX、自动回车",
+			line: "TX AT+RST 00",
+			want: AutoCmd{Type: "TX", Number: 0, Text: "AT+RST", Hex: false, Enter: true},
+		},
+		{
+			name: "hex=1 写在延时数字之后",
+			line: "TX 01 02 03 00 hex=1",
+			want: AutoCmd{Type: "TX", Number: 0, Text: "01 02 03", Hex: true, Enter: true},
+		},
+		{
+			name: "enter=0 写在延时数字之后",
+			line: "TX hello 05 enter=0",
+			want: AutoCmd{Type: "TX", Number: 5, Text: "hello", Hex: false, Enter: false},
+		},
+		{
+			name: "文本中间的 AT+HEX=1 不是关键字",
+			line: "TX AT+HEX=1 00",
+			want: AutoCmd{Type: "TX", Number: 0, Text: "AT+HEX=1", Hex: false, Enter: true},
+		},
+	}
+	for _, c := range cases {
+		if got := parseAutoCmdLine(c.line); got != c.want {
+			t.Errorf("%s: parseAutoCmdLine(%q) = %#v, 期望 %#v", c.name, c.line, got, c.want)
+		}
+	}
+}
+
+// RX 行是文本包含匹配：hex= / enter= 对它没有意义，两个开关必须取默认值。
+func TestAutoCmdRxIgnoresKeywords(t *testing.T) {
+	got := parseAutoCmdLine("RX ready 05 hex=1 enter=0")
+	if got.Hex || !got.Enter {
+		t.Fatalf("RX 行必须忽略 hex=/enter=，得到 %#v", got)
+	}
+}
+
+// Hex / Enter 四种组合经 formatAutoCmds 写盘再读回必须不变；
+// 关键字只在非默认时出现（Hex 为真写 hex=1，Enter 为假写 enter=0），RX 行一个都不写。
+func TestAutoCmdHexEnterFormatRoundTrip(t *testing.T) {
+	cases := []struct {
+		name string
+		cmd  AutoCmd
+	}{
+		{"默认（不写关键字）", AutoCmd{Type: "TX", Number: 0, Text: "AT+RST", Hex: false, Enter: true}},
+		{"只有 hex", AutoCmd{Type: "TX", Number: 0, Text: "01 02 03", Hex: true, Enter: true}},
+		{"只有 enter=0", AutoCmd{Type: "TX", Number: 5, Text: "AT+RST", Hex: false, Enter: false}},
+		{"hex 与 enter=0 都写", AutoCmd{Type: "TX", Number: 7, Text: "AA BB", Hex: true, Enter: false}},
+	}
+	for _, c := range cases {
+		formatted := formatAutoCmds([]AutoCmd{c.cmd})
+		var line string
+		for _, l := range strings.Split(formatted, "\n") {
+			if strings.HasPrefix(l, "TX ") {
+				line = l
+				break
+			}
+		}
+		if line == "" {
+			t.Fatalf("%s: 没有写出 TX 行，内容 %q", c.name, formatted)
+		}
+		if gotHexKw, wantHexKw := strings.Contains(line, "hex="), c.cmd.Hex; gotHexKw != wantHexKw {
+			t.Errorf("%s: 行 %q 的 hex 关键字出现=%v, 期望 %v", c.name, line, gotHexKw, wantHexKw)
+		}
+		if gotEnterKw, wantEnterKw := strings.Contains(line, "enter="), !c.cmd.Enter; gotEnterKw != wantEnterKw {
+			t.Errorf("%s: 行 %q 的 enter 关键字出现=%v, 期望 %v", c.name, line, gotEnterKw, wantEnterKw)
+		}
+
+		got := parseAutoCmdsText(formatted)
+		if len(got) != 1 {
+			t.Fatalf("%s: 读回条数 %d, 期望 1（内容 %q）", c.name, len(got), formatted)
+		}
+		if got[0] != c.cmd {
+			t.Errorf("%s: 读回 %#v, 期望 %#v", c.name, got[0], c.cmd)
+		}
+	}
+
+	// RX 行永远不写关键字，读回时两个开关取默认值
+	rx := AutoCmd{Type: "RX", Number: 5, Text: "ready", Enter: true}
+	formatted := formatAutoCmds([]AutoCmd{rx})
+	var rxLine string
+	for _, l := range strings.Split(formatted, "\n") {
+		if strings.HasPrefix(l, "RX ") {
+			rxLine = l
+			break
+		}
+	}
+	if rxLine == "" {
+		t.Fatalf("没有写出 RX 行，内容 %q", formatted)
+	}
+	if strings.Contains(rxLine, "hex=") || strings.Contains(rxLine, "enter=") {
+		t.Fatalf("RX 行不应写 hex=/enter= 关键字，行内容 %q", rxLine)
+	}
+	if got := parseAutoCmdsText(formatted); len(got) != 1 || got[0] != rx {
+		t.Fatalf("RX 行读回 %#v, 期望 %#v", got, rx)
+	}
+}
+
+// encodeCmdPayload 是唯一的载荷编码入口：HEX 走 parseHexBytes，文本走 decodeCmdText，最后按需补回车。
+func TestAutoCmdEncodePayload(t *testing.T) {
+	cases := []struct {
+		name      string
+		text      string
+		asHex     bool
+		withEnter bool
+		want      string
+		wantErr   bool
+	}{
+		{"HEX 字节", "AA BB", true, false, "\xaa\xbb", false},
+		{"HEX 也按 Enter 补回车", "AA BB", true, true, "\xaa\xbb\r", false},
+		{"HEX 内容非法", "ZZ", true, true, "", true},
+		{"文本补回车", "AT", false, true, "AT\r", false},
+		{"已有 LF 不再补回车", "AT\n", false, true, "AT\n", false},
+		{"不要回车", "AT", false, false, "AT", false},
+		{"展开功能键后裁掉尾部空白", "AT+{ENTER}   ", false, true, "AT+\r", false},
+	}
+	for _, c := range cases {
+		got, err := encodeCmdPayload(c.text, c.asHex, c.withEnter)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("%s: encodeCmdPayload(%q, %v, %v) 应当报错，得到 % x", c.name, c.text, c.asHex, c.withEnter, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: 意外错误: %v", c.name, err)
+			continue
+		}
+		if string(got) != c.want {
+			t.Errorf("%s: encodeCmdPayload(%q, %v, %v) = %q, 期望 %q", c.name, c.text, c.asHex, c.withEnter, string(got), c.want)
+		}
 	}
 }
 
@@ -181,8 +322,8 @@ func TestExportImportAutoCmds(t *testing.T) {
 	app := &App{}
 
 	want := []AutoCmd{
-		{Type: "TX", Number: 1, Text: "AT+RST{ENTER}"},
-		{Type: "RX", Number: 7, Text: "ready"},
+		{Type: "TX", Number: 1, Text: "AT+RST{ENTER}", Enter: true},
+		{Type: "RX", Number: 7, Text: "ready", Enter: true},
 	}
 	if err := app.SaveAutoCmds(want); err != nil {
 		t.Fatalf("保存失败: %v", err)

@@ -545,10 +545,14 @@ func (a *App) runCommands(cmds []AutoCmd, deadline time.Time) bool {
 				return false
 			}
 		} else {
-			// TX：先展开 {ENTER} / {UP} 之类功能键标记，再裁掉尾部空白，
-			// 末尾没有回车时补一个 \r（命令后面常带空格，直接拼接会识别不到）
-			payload := buildTxPayload(cmd.Text)
-			if res := a.taskSend(payload); strings.HasPrefix(res, "Error") || strings.HasPrefix(res, "Send") {
+			// TX：统一走 encodeCmdPayload —— HEX 按字节解析，文本展开 {ENTER} / {UP} 之类功能键标记，
+			// 再按 Enter 决定是否补一个 \r（命令后面常带空格，直接拼接会识别不到）。
+			payload, encErr := encodeCmdPayload(cmd.Text, cmd.Hex, cmd.Enter)
+			if encErr != nil {
+				t.set(func(rt *TaskRuntime) { rt.Message = fmt.Sprintf("第 %d 条命令编码失败：%v", i+1, encErr) })
+				return false
+			}
+			if res := a.taskSend(string(payload)); strings.HasPrefix(res, "Error") || strings.HasPrefix(res, "Send") {
 				t.set(func(rt *TaskRuntime) { rt.Message = "发送失败：" + res })
 				return false
 			}

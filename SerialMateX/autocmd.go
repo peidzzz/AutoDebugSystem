@@ -35,18 +35,24 @@ var (
 const autoCmdTemplate = `# SerialMateX AUTO CMD 命令列表
 # 一行一条命令，格式：TX <命令文本> <数字> / RX <命令文本> <数字>
 # 数字在行尾，两位（00 ~ 99），默认 00
+# 行尾可加 hex=1（按十六进制字节发送）/ enter=0（不自动补回车），只对 TX 行有效
 # TX 用绿色显示，RX 用红色显示；以 # 或 ; 开头的行是注释，不会被载入
 # 示例：
 # TX AT+RST 00
+# TX 01 02 03 00 hex=1
 # RX ready 05
 
 `
 
 // AutoCmd 是一条自动命令：Type 为 "TX" 或 "RX"，Number 为行尾数字（00 ~ 99，默认 0），Text 为命令内容。
+// Hex 表示 TX 内容按十六进制字节解析，Enter 表示 TX 末尾自动补 \r；两者只对 TX 有意义，
+// 缺省为 Hex=false、Enter=true，写盘时只在非默认时写 hex=1 / enter=0。
 type AutoCmd struct {
 	Type   string `json:"type"`
 	Number int    `json:"number"`
 	Text   string `json:"text"`
+	Hex    bool   `json:"hex"`
+	Enter  bool   `json:"enter"`
 }
 
 // AutoCmdPath 返回 auto_cmd.txt 的路径：优先环境变量，否则与可执行文件同目录。
@@ -89,7 +95,8 @@ func (a *App) GetAutoCmds() []AutoCmd {
 }
 
 // parseAutoCmdLine 解析一行 “TX AT+RST 00” / “RX ready 05”；没有前缀时按 TX 处理。
-// 行尾最后一个 token 如果全是数字、且前面还有命令文本，就当作数字；否则数字为 0。
+// TX 行尾的 hex=1 / enter=0 关键字会先被削掉（RX 行不认关键字），再按行尾数字取延时；
+// 数字拆不出来时数字为 0，关键字缺省为 Hex=false、Enter=true。
 // 另外兼容第 34 轮 “TX 0 AT+RST”（数字紧跟在类型后面）的写法。
 func parseAutoCmdLine(line string) AutoCmd {
 	// 支持 “TX xxx”、“TX:xxx”、“TX=xxx”
@@ -97,11 +104,70 @@ func parseAutoCmdLine(line string) AutoCmd {
 		if idx := strings.Index(line, sep); idx > 0 {
 			tag := strings.ToUpper(strings.TrimSpace(line[:idx]))
 			if tag == "TX" || tag == "RX" {
-				return mkat(tag, strings.TrimSpace(line[idx+len(sep):]))
+				return parseAutoCmdBody(tag, strings.TrimSpace(line[idx+len(sep):]))
 			}
 		}
 	}
-	return mkat("TX", line)
+	return parseAutoCmdBody("TX", line)
+}
+
+// parseAutoCmdBody 按类型解析 “命令文本 [数字]”：TX 先削掉行尾关键字并把两个开关填好，
+// RX 是文本包含匹配，hex= / enter= 对它没有意义，开关取缺省值。
+func parseAutoCmdBody(tag, rest string) AutoCmd {
+	if tag == "RX" {
+		cmd := mkat(tag, rest)
+		cmd.Enter = true
+		return cmd
+	}
+	body, asHex, withEnter := splitAutoCmdKeywords(rest)
+	cmd := mkat(tag, body)
+	cmd.Hex, cmd.Enter = asHex, withEnter
+	return cmd
+}
+
+// splitAutoCmdKeywords 从行尾往前削掉 hex= / enter= 关键字，返回清理后的命令文本与两个已带缺省的值。
+// 只认整词（大小写不敏感，值接受 1/0、true/false、on/off、是/否），并且必须从行尾连续匹配：
+// 遇到第一个不是关键字的词就停，所以文本中间的 “AT+HEX=1” 不会被误吞。
+func splitAutoCmdKeywords(rest string) (body string, asHex bool, withEnter bool) {
+	body = strings.TrimSpace(rest)
+	asHex, withEnter = false, true
+	for {
+		i := strings.LastIndexAny(body, " \t")
+		token, head := body, ""
+		if i >= 0 {
+			token, head = body[i+1:], strings.TrimSpace(body[:i])
+		}
+
+		name, value, ok := strings.Cut(strings.ToLower(token), "=")
+		if !ok {
+			break
+		}
+		flag, ok := parseCmdKeywordBool(value)
+		if !ok {
+			break
+		}
+		switch name {
+		case "hex":
+			asHex = flag
+		case "enter":
+			withEnter = flag
+		default:
+			return strings.TrimSpace(body), asHex, withEnter
+		}
+		body = head
+	}
+	return strings.TrimSpace(body), asHex, withEnter
+}
+
+// parseCmdKeywordBool 解析 hex= / enter= 的取值：1/0、true/false、on/off、是/否，大小写不敏感。
+func parseCmdKeywordBool(value string) (bool, bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "on", "是":
+		return true, true
+	case "0", "false", "off", "否":
+		return false, true
+	}
+	return false, false
 }
 
 // mkat 把 “命令文本 [数字]”（数字在行尾）拆成 AutoCmd；拆不出来时整段当文本、数字为 0。
@@ -252,17 +318,33 @@ func decodeHexToken(inner string) (string, bool) {
 	return string([]byte{byte(v)}), true
 }
 
-// buildTxPayload 生成 TX 命令实际要发送的字节：
-//   - 先展开功能键标记；
-//   - 去掉尾部的空格 / 制表符；
-//   - 末尾没有回车（CR / LF）时自动补一个 CR，保证下位机能识别到一条完整命令。
-func buildTxPayload(text string) string {
-	payload := decodeCmdText(strings.TrimSpace(text))
-	payload = strings.TrimRight(payload, " \t")
-	if !strings.HasSuffix(payload, "\r") && !strings.HasSuffix(payload, "\n") {
-		payload += "\r"
+// encodeCmdPayload 是 TX 载荷唯一的编码入口：
+//   - asHex 时按空格分隔的十六进制字节解析，非法内容原样返回错误；
+//   - 否则展开 {ENTER} / {UP} 之类功能键标记，并裁掉尾部空格 / 制表符；
+//   - withEnter 且末字节不是回车（CR / LF）时补一个 CR，保证下位机能识别到一条完整命令。
+func encodeCmdPayload(text string, asHex, withEnter bool) ([]byte, error) {
+	var payload []byte
+	if asHex {
+		b, err := parseHexBytes(text)
+		if err != nil {
+			return nil, err
+		}
+		payload = b
+	} else {
+		// 只裁尾部的空格 / 制表符：显式写在末尾的 \r / \n 要保留，交给下面的 withEnter 判断。
+		payload = []byte(strings.TrimRight(decodeCmdText(text), " \t"))
 	}
-	return payload
+	if withEnter && !strings.HasSuffix(string(payload), "\r") && !strings.HasSuffix(string(payload), "\n") {
+		payload = append(payload, '\r')
+	}
+	return payload, nil
+}
+
+// buildTxPayload 生成 TX 命令实际要发送的字节，是 encodeCmdPayload 的兼容包装：
+// 等价于 encodeCmdPayload(text, false, true)，老调用与老测试不用改。
+func buildTxPayload(text string) string {
+	payload, _ := encodeCmdPayload(text, false, true)
+	return string(payload)
 }
 
 // formatAutoCmds 生成 auto_cmd.txt 的内容（保存与导出共用）。
@@ -270,6 +352,7 @@ func formatAutoCmds(cmds []AutoCmd) string {
 	var b strings.Builder
 	b.WriteString("# SerialMateX AUTO CMD 命令列表\n")
 	b.WriteString("# 一行一条命令，格式：TX <命令文本> <数字> / RX <命令文本> <数字>（数字在行尾，0 ~ 99）\n")
+	b.WriteString("# 行尾可加 hex=1 / enter=0（只写在 TX 行，且只在非默认时写）\n")
 	b.WriteString("# 命令里可用功能键标记：{ENTER} {TAB} {ESC} {UP} {DOWN} {LEFT} {RIGHT} {HOME} {END} {PGUP} {PGDN} {DEL} {INS} {BACKSPACE} {SPACE} {0x1B}\n")
 	for _, cmd := range cmds {
 		// 一条命令只能占一行：换行符会被压成空格，避免破坏文件结构
@@ -287,6 +370,15 @@ func formatAutoCmds(cmds []AutoCmd) string {
 		b.WriteString(text)
 		b.WriteString(" ")
 		b.WriteString(strconv.Itoa(clampInt(cmd.Number, 0, maxAutoCmdNumber)))
+		// 只写非默认值：Hex 为真写 hex=1，Enter 为假写 enter=0；RX 行一个都不写。
+		if tag == "TX" {
+			if cmd.Hex {
+				b.WriteString(" hex=1")
+			}
+			if !cmd.Enter {
+				b.WriteString(" enter=0")
+			}
+		}
 		b.WriteString("\n")
 	}
 	return b.String()
@@ -374,4 +466,3 @@ func (a *App) ImportAutoCmds() (string, error) {
 	}
 	return strconv.Itoa(n), nil
 }
-
