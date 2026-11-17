@@ -485,39 +485,41 @@ const openAutoCmdDialog = (index: number) => {
   autoCmdDialog.type = cmd ? cmd.type : 'TX';
   autoCmdDialog.numberText = formatCmdNumber(cmd ? cmd.number : 0);
   autoCmdDialog.numberError = '';
-  // RX 行不认这两个开关，打开时也按默认值显示，避免出现“灰着却显示开”的矛盾状态
-  autoCmdDialog.hex = !!cmd && cmd.type === 'TX' && !!cmd.hex;
-  autoCmdDialog.enter = !cmd || cmd.type !== 'TX' ? true : cmd.enter !== false;
+  // 原样回填行里的值：RX 行后端从不写 hex=/enter=，显示时由 dialogEnterOn / hexChecked 伪装成默认值
+  autoCmdDialog.hex = !!cmd && !!cmd.hex;
+  autoCmdDialog.enter = !cmd || cmd.enter !== false;
   autoCmdDialog.show = true;
   nextTick(() => autoCmdInputRef.value?.focus());
 };
 
-// 弹窗里点 TX / RX 标志即切换类型；RX 是文本包含匹配，HEX / 回车 对它没有意义，切过去就回落默认值
+// 弹窗里点 TX / RX 标志即切换类型。HEX / 回车 只决定 TX 怎么发，切换时**不动**已存的值，
+// 这样 TX → RX → TX 不会把一条十六进制命令退化成文本命令；RX 下开关只是置灰展示（见 dialogEnterOn），
+// 真正归一化成默认值只在保存时做。
 const toggleDialogCmdType = () => {
   autoCmdDialog.type = autoCmdDialog.type === 'TX' ? 'RX' : 'TX';
-  if (autoCmdDialog.type === 'RX') {
-    autoCmdDialog.hex = false;
-    autoCmdDialog.enter = true;
-  }
 };
 
-// HEX 预览：规则与后端 parseHexBytes 一致——空格分隔，每段 1~2 位十六进制（可带 0x），
-// 统一补成两位大写；内容为空时 bytes 为空、仍算合法（清空后保存等于删掉这一条）。
+// HEX 预览：规则与后端 encodeCmdPayload 一致——空格分隔，每段 1~2 位十六进制（可带 0x），
+// 统一补成两位大写；回车开着且末字节不是 CR/LF 时，实际发送还会再补一个 0D，预览里一并显示出来。
+// 内容为空时 bytes 为空、仍算合法（清空后保存等于删掉这一条）。
 const hexPreview = computed(() => {
   const raw = autoCmdDialog.text.trim();
-  if (raw === '') return { bytes: '', valid: true };
+  if (raw === '') return { bytes: '', valid: true, autoCr: false };
   const bytes: string[] = [];
   for (const field of raw.split(/\s+/)) {
     const clean = field.replace(/^0[xX]/, '');
-    if (!/^[0-9a-fA-F]{1,2}$/.test(clean)) return { bytes: '', valid: false };
+    if (!/^[0-9a-fA-F]{1,2}$/.test(clean)) return { bytes: '', valid: false, autoCr: false };
     bytes.push(clean.toUpperCase().padStart(2, '0'));
   }
-  return { bytes: bytes.join(' '), valid: true };
+  const last = bytes[bytes.length - 1];
+  return { bytes: bytes.join(' '), valid: true, autoCr: autoCmdDialog.enter && last !== '0D' && last !== '0A' };
 });
 
 // HEX / 回车 只对 TX 生效；HEX 打开但内容不是合法十六进制时禁止保存
 const hexChecked = computed(() => autoCmdDialog.type === 'TX' && autoCmdDialog.hex);
 const hexInvalid = computed(() => hexChecked.value && !hexPreview.value.valid);
+// 回车开关在 RX 下只做展示：显示回落默认的「开」，但不改 autoCmdDialog.enter（切回 TX 时原值还在）
+const dialogEnterOn = computed(() => (autoCmdDialog.type === 'RX' ? true : autoCmdDialog.enter));
 
 // 功能键标记：点一下插入到光标处，后端发送前会替换成实际按键字节
 const cmdKeyButtons = [
@@ -2220,7 +2222,7 @@ const scrollToBottom = () => {
           <!-- 行尾数字：固定两位（00 ~ 99）；运行到该条时用倒计时覆盖显示 -->
           <span class="cmd-count mono"
                 :class="taskRt.running && taskRt.cmdIndex === i && taskRt.cmdPhase === 'wait' ? 'is-live' : ''"
-                :title="taskRt.running && taskRt.cmdIndex === i ? '间隔倒计时' : '双击命令可修改该数字'">
+                :title="taskRt.running && taskRt.cmdIndex === i ? '间隔倒计时' : '双击命令可修改（含延时）'">
             {{ taskRt.running && taskRt.cmdIndex === i && taskRt.cmdPhase === 'wait'
               ? String(taskRt.cmdCountdown)
               : formatCmdNumber(cmd.number) }}
@@ -2460,23 +2462,23 @@ const scrollToBottom = () => {
                       :title="`点击切换为 ${autoCmdDialog.type === 'TX' ? 'RX' : 'TX'}`">
                 {{ autoCmdDialog.type }}
               </button>
-              <!-- HEX / 回车：只对 TX 生效；RX 是文本包含匹配，两个开关置灰并回落默认值 -->
+              <!-- HEX / 回车：只对 TX 生效；RX 下只置灰展示默认值，已有的 TX 值留在模型里等保存时归一化 -->
               <div class="flag-col">
                 <div class="flag-row" :class="{ 'is-off': autoCmdDialog.type === 'RX' }">
                   <span class="flag-label">HEX</span>
                   <button @click="autoCmdDialog.hex = !autoCmdDialog.hex"
                           class="switch"
-                          :class="{ 'is-on': autoCmdDialog.hex }"
+                          :class="{ 'is-on': hexChecked }"
                           :disabled="autoCmdDialog.type === 'RX'"
-                          :title="autoCmdDialog.type === 'RX' ? 'RX 是文本匹配，不支持 HEX' : (autoCmdDialog.hex ? '点击改为关' : '点击改为开')"><span class="switch-knob"></span><span class="switch-text">{{ autoCmdDialog.hex ? '开' : '关' }}</span></button>
+                          :title="autoCmdDialog.type === 'RX' ? 'RX 是文本匹配，不支持 HEX' : (autoCmdDialog.hex ? '点击改为关' : '点击改为开')"><span class="switch-knob"></span><span class="switch-text">{{ hexChecked ? '开' : '关' }}</span></button>
                 </div>
                 <div class="flag-row" :class="{ 'is-off': autoCmdDialog.type === 'RX' }">
                   <span class="flag-label">回车</span>
                   <button @click="autoCmdDialog.enter = !autoCmdDialog.enter"
                           class="switch"
-                          :class="{ 'is-on': autoCmdDialog.enter }"
+                          :class="{ 'is-on': dialogEnterOn }"
                           :disabled="autoCmdDialog.type === 'RX'"
-                          :title="autoCmdDialog.type === 'RX' ? 'RX 是文本匹配，不发送数据' : (autoCmdDialog.enter ? '点击改为关' : '点击改为开')"><span class="switch-knob"></span><span class="switch-text">{{ autoCmdDialog.enter ? '开' : '关' }}</span></button>
+                          :title="autoCmdDialog.type === 'RX' ? 'RX 是文本匹配，不发送数据' : (autoCmdDialog.enter ? '点击改为关' : '点击改为开')"><span class="switch-knob"></span><span class="switch-text">{{ dialogEnterOn ? '开' : '关' }}</span></button>
                 </div>
               </div>
               <textarea v-model="autoCmdDialog.text" rows="3" ref="autoCmdInputRef"
@@ -2499,25 +2501,26 @@ const scrollToBottom = () => {
               </div>
             </div>
 
-            <!-- HEX 预览：按字节还原成 AA BB CC；内容非法时改显示错误并禁止保存 -->
+            <!-- HEX 预览：按字节还原成 AA BB CC，并补上回车开关实际会追加的 0D；内容非法时改显示错误并禁止保存 -->
             <p v-if="hexInvalid" class="err-line">不是合法的十六进制</p>
             <p v-else-if="hexChecked" class="hex-preview">
               <span class="hex-preview-cap">发送字节</span>
-              <span class="mono">{{ hexPreview.bytes || '（空）' }}</span>
+              <span class="mono">{{ hexPreview.bytes ? `${hexPreview.bytes}${hexPreview.autoCr ? ' 0D' : ''}` : '（空）' }}</span>
             </p>
             <p v-if="autoCmdDialog.numberError" class="err-line">{{ autoCmdDialog.numberError }}</p>
 
-            <!-- 功能键插入条：点一下就把标记插到光标处，发送时由后端换成实际按键字节 -->
+            <!-- 功能键插入条：点一下就把标记插到光标处，发送时由后端换成实际按键字节；HEX 模式下后端不解析标记，直接置灰 -->
             <div class="key-row">
               <span class="key-label">功能键</span>
               <button v-for="k in cmdKeyButtons" :key="k.token" type="button"
                       @click="insertCmdKey(k.token)"
                       class="key-chip mono"
-                      :title="k.tip">{{ k.label }}</button>
+                      :disabled="hexChecked"
+                      :title="hexChecked ? 'HEX 模式下功能键标记不生效' : k.tip">{{ k.label }}</button>
             </div>
 
             <p class="hint-line">点左侧标志可在 TX / RX 之间切换；「延时」是这条命令之后等待的秒数，只能两位（00 ~ 99）；Ctrl + Enter 保存；清空内容后保存会删除这一条。</p>
-            <p class="hint-line">HEX 打开后按空格分隔的十六进制字节发送（如 <span class="mono">AA BB CC</span>，可带 0x），此时功能键标记不生效；回车关掉后 TX 不再自动补 0x0D。功能键标记会原样保存在命令里（如 <span class="mono">AT+RST{ENTER}{UP}</span>），发送时替换成实际按键；末尾没有 {ENTER}/{LF} 时 TX 会自动补一个回车；{0x1B} 可发任意单字节。</p>
+            <p class="hint-line">HEX 打开后按空格分隔的十六进制字节发送（如 <span class="mono">AA BB CC</span>，可带 0x），此时功能键不可用；回车开着时末尾会自动补 0D，关掉就不再补。功能键标记会原样保存在命令里（如 <span class="mono">AT+RST{ENTER}{UP}</span>），发送时替换成实际按键；末尾没有 {ENTER}/{LF} 时 TX 会自动补一个回车；{0x1B} 可发任意单字节。</p>
           </div>
 
           <div class="modal-foot modal-foot--end">
@@ -3709,8 +3712,8 @@ const scrollToBottom = () => {
   color: var(--text-sub);
 }
 .flag-col .switch { flex: none; }
-/* RX 时标签一并淡出，和置灰的开关保持同一层次 */
-.flag-row.is-off { opacity: 0.55; }
+/* RX 下只淡化标签：开关本身已由 .switch:disabled 的 .5 透明度处理，两层叠加会看不清 */
+.flag-row.is-off .flag-label { opacity: 0.6; }
 .type-toggle {
   flex: none;
   width: 42px;
@@ -3768,6 +3771,9 @@ const scrollToBottom = () => {
   transition: background 0.14s, border-color 0.14s;
 }
 .key-chip:hover { background: var(--hover); border-color: var(--line-2); }
+/* HEX 模式下后端不解析功能键标记，直接禁用这一排按钮 */
+.key-chip:disabled { opacity: 0.4; cursor: not-allowed; }
+.key-chip:disabled:hover { background: var(--card); border-color: var(--line); }
 .hint-line { font-size: 10px; line-height: 1.55; color: var(--text-sub); }
 .modal-msg {
   margin: 0;
