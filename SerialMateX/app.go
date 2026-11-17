@@ -37,7 +37,12 @@ type App struct {
 	readStopChan chan struct{}
 
 	// 串口资源
-	serialPort serial.Port
+	serialPort     serial.Port
+	serialPortName string
+
+	// 电源串口（只写不读，任务运行期间打开）
+	pwrPort io.WriteCloser
+	pwrMu   sync.Mutex
 
 	// 网络资源
 	netConn     net.Conn       // 用于 TCP Client, active TCP Server conn
@@ -79,15 +84,9 @@ func (a *App) GetSerialPorts() ([]string, error) {
 
 // --- 连接逻辑封装 ---
 
-// OpenSerial 打开串口
-func (a *App) OpenSerial(portName string, baudRate int, dataBits int, stopBits int, parityName string) string {
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
-
-	if a.isConnected {
-		return "Already connected"
-	}
-
+// buildSerialMode 把界面上的串口参数映射成 go.bug.st/serial 的模式。
+// 校验位与停止位的映射集中在这里，SERIAL 口与电源口共用同一份规则。
+func buildSerialMode(baudRate, dataBits, stopBits int, parityName string) *serial.Mode {
 	var parity serial.Parity
 	switch parityName {
 	case "None":
@@ -116,12 +115,24 @@ func (a *App) OpenSerial(portName string, baudRate int, dataBits int, stopBits i
 		stop = serial.OneStopBit
 	}
 
-	mode := &serial.Mode{
+	return &serial.Mode{
 		BaudRate: baudRate,
 		DataBits: dataBits,
 		Parity:   parity,
 		StopBits: stop,
 	}
+}
+
+// OpenSerial 打开串口
+func (a *App) OpenSerial(portName string, baudRate int, dataBits int, stopBits int, parityName string) string {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+
+	if a.isConnected {
+		return "Already connected"
+	}
+
+	mode := buildSerialMode(baudRate, dataBits, stopBits, parityName)
 
 	port, err := serial.Open(portName, mode)
 	if err != nil {
@@ -133,6 +144,8 @@ func (a *App) OpenSerial(portName string, baudRate int, dataBits int, stopBits i
 	port.SetRTS(true)
 
 	a.serialPort = port
+	// 记下端口名：启动任务时用它拒绝“电源口与 SERIAL 口是同一个口”
+	a.serialPortName = portName
 	a.connType = TypeSerial
 	a.startReadLoop(port) // 启动通用读取循环
 
@@ -463,6 +476,8 @@ func (a *App) Close() string {
 			err = a.serialPort.Close()
 			a.serialPort = nil
 		}
+		// 断开后清空端口名，避免换了连接方式后还拿旧端口做同口校验。
+		a.serialPortName = ""
 	case TypeJLink:
 		if a.jlinkConn != nil {
 			a.jlinkConn.Close()

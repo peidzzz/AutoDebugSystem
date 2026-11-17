@@ -93,11 +93,26 @@ func (a *App) StartTask(opts TaskRunOptions) string {
 	if !ok {
 		return "没有找到电源设备：" + opts.DeviceName
 	}
-	if _, err := parseHexBytes(device.PowerOn); err != nil {
-		return "PWR-ON 不是合法的十六进制串：" + device.PowerOn
+
+	// 电源指令走设备自己的 COM 口，所以必须配端口，而且不能和 SERIAL 口是同一个。
+	if strings.TrimSpace(device.Port) == "" {
+		return "设备 " + device.Name + " 没有配置 COM 端口"
 	}
-	if _, err := parseHexBytes(device.PowerOff); err != nil {
-		return "PWR-OFF 不是合法的十六进制串：" + device.PowerOff
+	if strings.EqualFold(device.Port, a.serialPortName) {
+		return "电源端口 " + device.Port + " 不能与 SERIAL 端口相同"
+	}
+
+	// 上电 / 掉电先各编码一次：非法内容在启动时就报出来，而不是跑到一半才失败。
+	if _, err := encodeCmdPayload(device.PowerOn, device.PowerOnHex, device.PowerOnEnter); err != nil {
+		return "PWR-ON 编码失败：" + err.Error()
+	}
+	if _, err := encodeCmdPayload(device.PowerOff, device.PowerOffHex, device.PowerOffEnter); err != nil {
+		return "PWR-OFF 编码失败：" + err.Error()
+	}
+
+	// 打开电源口；失败时立刻返回，不留下半启动的任务。
+	if err := a.openPwrDevice(device); err != nil {
+		return "打开电源端口 " + device.Port + " 失败：" + err.Error()
 	}
 
 	t.reset(cfg)
@@ -389,6 +404,9 @@ func formatCurrent(v float64, has bool) string {
 
 // runTask 是一轮轮测试的主循环。
 func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts TaskRunOptions) {
+	// 电源口在 StartTask 里打开，这里保证任务无论从哪条路径结束都会关闭它。
+	defer a.closePwrDevice()
+
 	t := &a.task
 	dir := taskLogDir()
 
@@ -412,6 +430,8 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 	t.mu.Unlock()
 
 	aborted := false
+	// failMsg 记下真正的失败原因（上电/掉电/电源口写入），结束时优先显示它。
+	failMsg := ""
 	var stopCsv func()
 
 	for round := 1; round <= cfg.RunCount; round++ {
@@ -434,8 +454,9 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			if logPath != "" {
 				appendFile(logPath, taskLogBanner("第 "+strconv.Itoa(round)+" 次上电", device.Name))
 			}
-		} else if err := a.sendBytes(device.PowerOn); err != nil {
-			t.set(func(rt *TaskRuntime) { rt.Message = "上电失败：" + err.Error() })
+		} else if err := a.sendBytes(device.PowerOn, device.PowerOnHex, device.PowerOnEnter); err != nil {
+			failMsg = "上电失败：" + err.Error()
+			t.set(func(rt *TaskRuntime) { rt.Message = failMsg })
 			aborted = true
 			break
 		} else {
@@ -458,7 +479,7 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 
 		if !t.countdown(deadline, "running", "powerOff") {
 			t.set(func(rt *TaskRuntime) { rt.PowerOn = false })
-			_ = a.sendBytes(device.PowerOff)
+			_ = a.sendBytes(device.PowerOff, device.PowerOffHex, device.PowerOffEnter)
 			aborted = true
 			break
 		}
@@ -473,9 +494,13 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			t.set(func(rt *TaskRuntime) { rt.Paused = false; rt.Message = "" })
 		}
 
-		// 掉电。
-		_ = a.sendBytes(device.PowerOff)
+		// 掉电。写不出去说明电源口已经不可用，再跑下一轮没有意义，直接中止。
+		offErr := a.sendBytes(device.PowerOff, device.PowerOffHex, device.PowerOffEnter)
 		t.set(func(rt *TaskRuntime) { rt.PowerOn = false })
+		if offErr != nil {
+			failMsg = "掉电失败：" + offErr.Error()
+			t.set(func(rt *TaskRuntime) { rt.Message = failMsg })
+		}
 		if logPath != "" {
 			appendFile(logPath, taskLogBanner("第 "+strconv.Itoa(round)+" 次测试停止", device.Name))
 		}
@@ -483,8 +508,12 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			stopCsv()
 			stopCsv = nil
 		}
-		if complete {
+		if complete && offErr == nil {
 			t.set(func(rt *TaskRuntime) { rt.NormalCount++ })
+		}
+		if offErr != nil {
+			aborted = true
+			break
 		}
 
 		if round == cfg.RunCount || t.stopped() {
@@ -510,6 +539,12 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 		msg = "任务已停止"
 	}
 	t.set(func(rt *TaskRuntime) {
+		// 中途失败时保留具体原因（上电失败 / 掉电失败 / 电源口写入失败），不要被完成语覆盖掉。
+		if failMsg != "" {
+			rt.Message = failMsg
+		} else {
+			rt.Message = msg
+		}
 		rt.Running = false
 		rt.Paused = false
 		rt.Phase = "done"
@@ -519,7 +554,6 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 		rt.CmdIndex = -1
 		rt.CmdPhase = ""
 		rt.CmdCountdown = 0
-		rt.Message = msg
 	})
 }
 
@@ -617,16 +651,13 @@ func (a *App) findPwrDevice(name string) (PwrDevice, bool) {
 	return PwrDevice{}, false
 }
 
-// sendBytes 把十六进制串（如 "0x01 0x02" / "AA 00"）按字节发到串口。
-func (a *App) sendBytes(hexText string) error {
-	payload, err := parseHexBytes(hexText)
+// sendBytes 把电源指令按设备配置（HEX / 回车）编码后写到电源口。
+func (a *App) sendBytes(text string, asHex, withEnter bool) error {
+	payload, err := encodeCmdPayload(text, asHex, withEnter)
 	if err != nil {
 		return err
 	}
-	if res := a.taskSend(string(payload)); strings.HasPrefix(res, "Error") || strings.HasPrefix(res, "Send") {
-		return fmt.Errorf("%s", res)
-	}
-	return nil
+	return a.writePwrPort(payload)
 }
 
 // taskSendHook 只给测试用：替换真正的发送实现，便于断言发出的字节。
