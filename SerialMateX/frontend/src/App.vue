@@ -707,16 +707,31 @@ const toggleAutoRun = async () => {
 };
 
 // 异常暂停后的两条出路：结束任务（掉电并收工） / 跳过本轮（掉电，等间隔后继续下一轮）
+// 点下后立刻置忙：Go 侧投递完决定就返回，要等下一个 200ms 轮询才变非暂停，
+// 不挡住第二次点击就会拿回「当前不在异常暂停状态」并弹一个假错误。
+const taskBusy = ref(false);
 const endTask = async () => {
-  const res = await EndTask();
-  if (res) showModal('结束任务失败', res, 'error');
-  await pollTaskRuntime();
+  if (taskBusy.value) return;
+  taskBusy.value = true;
+  try {
+    const res = await EndTask();
+    if (res) showModal('结束任务失败', res, 'error');
+    await pollTaskRuntime();
+  } finally {
+    taskBusy.value = false;
+  }
 };
 
 const skipRound = async () => {
-  const res = await SkipRound();
-  if (res) showModal('跳过本轮失败', res, 'error');
-  await pollTaskRuntime();
+  if (taskBusy.value) return;
+  taskBusy.value = true;
+  try {
+    const res = await SkipRound();
+    if (res) showModal('跳过本轮失败', res, 'error');
+    await pollTaskRuntime();
+  } finally {
+    taskBusy.value = false;
+  }
 };
 
 // 网络参数
@@ -2055,7 +2070,7 @@ const scrollToBottom = () => {
         <section v-if="mode === 'TASK'" class="panel">
           <div class="panel-head">
             <span class="eyebrow">Task status</span>
-            <span class="status-pill" :class="taskRt.running ? 'is-live' : ''">{{ taskRt.running ? 'RUN' : 'IDLE' }}</span>
+            <span class="status-pill" :class="taskRt.paused ? 'is-warn' : (taskRt.running ? 'is-live' : '')">{{ taskRt.paused ? 'PAUSED' : (taskRt.running ? 'RUN' : 'IDLE') }}</span>
           </div>
           <div class="panel-body">
             <div class="stat-row">
@@ -2088,7 +2103,7 @@ const scrollToBottom = () => {
             </div>
             <div v-if="taskRt.paused" class="paused-note">
               <span class="paused-note__dot"></span>
-              <span>已暂停 · 有命令未执行完</span>
+              <span>{{ taskRt.message || '有命令未执行完，已暂停' }}</span>
             </div>
           </div>
         </section>
@@ -2251,8 +2266,8 @@ const scrollToBottom = () => {
       <div class="run-foot" :class="{ 'run-foot--paused': taskRt.paused }">
         <div class="run-ring" :class="taskRt.paused ? 'run-ring--paused' : (taskRt.running ? 'run-ring--running' : 'run-ring--idle')">
           <template v-if="taskRt.paused">
-            <button @click="endTask" class="btn btn-warn" title="结束任务：掉电并结束整个任务">结束任务</button>
-            <button @click="skipRound" class="btn btn-primary" title="跳过本轮：本轮流不计数，掉电后等间隔再跑下一轮">跳过本轮</button>
+            <button @click="endTask" class="btn btn-warn" :disabled="taskBusy" title="结束任务：掉电并结束整个任务">结束任务</button>
+            <button @click="skipRound" class="btn btn-primary" :disabled="taskBusy" title="跳过本轮：本轮流不计数，掉电后等间隔再跑下一轮">跳过本轮</button>
           </template>
           <template v-else>
             <!-- 流光用 SVG 描边 + pathLength 归一化：整圈按弧长匀速跑，长短边不会有快慢差 -->
@@ -3130,7 +3145,6 @@ const scrollToBottom = () => {
   height: 5px;
   border-radius: 50%;
   background: var(--col-error);
-  animation: dot-pulse 1.8s ease-in-out infinite;
 }
 .status-pill.is-warn {
   color: var(--col-error);
