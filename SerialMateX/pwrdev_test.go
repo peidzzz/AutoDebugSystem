@@ -301,3 +301,103 @@ func TestPwrDevParseBoolText(t *testing.T) {
 		}
 	}
 }
+
+// TestPwrDevParityNormalized 验证校验位的大小写与常见别名都被收敛到
+// app.go 的串口映射认得的那 5 个写法；认不出的按 None（缺省）处理。
+func TestPwrDevParityNormalized(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"None", "None"},
+		{"none", "None"},
+		{" NONE ", "None"},
+		{"odd", "Odd"},
+		{"ODD", "Odd"},
+		{"Even", "Even"},
+		{"mark", "Mark"},
+		{"SPACE", "Space"},
+		{"无", "None"},
+		{"奇", "Odd"},
+		{"偶", "Even"},
+		{"", "None"},
+		{"banana", "None"},
+	}
+	for _, c := range cases {
+		path := filepath.Join(t.TempDir(), "pwr_dev.ini")
+		content := "[Board]\nPort=COM3\nPARITY=" + c.in + "\n"
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		devices, err := parsePwrDevFile(path)
+		if err != nil {
+			t.Fatalf("PARITY=%q parse error: %v", c.in, err)
+		}
+		if len(devices) != 1 {
+			t.Fatalf("PARITY=%q: want 1 device, got %+v", c.in, devices)
+		}
+		if devices[0].Parity != c.want {
+			t.Errorf("PARITY=%q: got %q, want %q", c.in, devices[0].Parity, c.want)
+		}
+	}
+}
+
+// TestPwrDevSaveAppliesDefaults 验证保存时会把缺省值补齐再落盘：
+// 零值设备（例如手工构造或老界面传来的）不能写出 BAUD=0/DATA=0/PARITY= 这样的坏值，
+// 否则下次解析只能靠 withDefaults 兜，文件本身已经不可读。
+func TestPwrDevSaveAppliesDefaults(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("SERIALMATEX_PWRDEV_DIR", dir)
+	app := &App{}
+
+	if err := app.SavePwrDevices([]PwrDevice{{Name: "Zero", Port: "COM5"}}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "pwr_dev.ini"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range []string{"BAUD=9600", "DATA=8", "STOP=1", "PARITY=None"} {
+		if !strings.Contains(string(raw), line) {
+			t.Errorf("ini missing default %q:\n%s", line, raw)
+		}
+	}
+	for _, bad := range []string{"BAUD=0", "DATA=0", "PARITY=\n"} {
+		if strings.Contains(string(raw), bad) {
+			t.Errorf("ini must not contain %q:\n%s", bad, raw)
+		}
+	}
+}
+
+// TestPwrDevDataBitsClamped 验证数据位只接受 5–8（串口驱动的合法范围），
+// 越界值（含老文件里的 0/9/16）统一回落成缺省 8，而不是把非法值原样交给驱动。
+func TestPwrDevDataBitsClamped(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"5", 5},
+		{"6", 6},
+		{"7", 7},
+		{"8", 8},
+		{"4", 8},
+		{"9", 8},
+		{"16", 8},
+		{"0", 8},
+		{"abc", 8},
+	}
+	for _, c := range cases {
+		path := filepath.Join(t.TempDir(), "pwr_dev.ini")
+		if err := os.WriteFile(path, []byte("[B]\nDATA="+c.in+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		devices, err := parsePwrDevFile(path)
+		if err != nil {
+			t.Fatalf("DATA=%q: %v", c.in, err)
+		}
+		if len(devices) != 1 || devices[0].DataBits != c.want {
+			t.Errorf("DATA=%q: got %+v, want dataBits %d", c.in, devices, c.want)
+		}
+	}
+}

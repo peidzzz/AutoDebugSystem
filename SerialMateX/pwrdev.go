@@ -122,6 +122,33 @@ func pwrBoolText(v bool) string {
 	return "0"
 }
 
+// normalizeParity 把校验位收敛到 app.go 的串口映射认得的 5 个写法
+// （None / Odd / Even / Mark / Space）：大小写不敏感，兼容常见的单字母与中文写法，
+// 认不出的按缺省 None 处理——否则手工编辑 ini 写 "odd" 会静默变成无校验，
+// 表现为偶发帧错误，极难排查。
+func normalizeParity(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "odd", "o", "奇", "奇校验":
+		return "Odd"
+	case "even", "e", "偶", "偶校验":
+		return "Even"
+	case "mark", "m", "markparity", "标记", "标记校验":
+		return "Mark"
+	case "space", "s", "spaceparity", "空格", "空格校验":
+		return "Space"
+	default:
+		return defaultPwrParity
+	}
+}
+
+// normalizeDataBits 把数据位收敛到串口驱动的合法范围 5–8，越界与非法值按缺省 8。
+func normalizeDataBits(v int) int {
+	if v >= 5 && v <= 8 {
+		return v
+	}
+	return defaultPwrDataBits
+}
+
 // withDefaults 补齐缺失的串口参数，让老文件与缺键的新配置都得到同样的行为。
 // 两个 HEX 开关的缺省值（true）在 newPwrDevice 里给出：布尔零值无法区分
 // “键不存在”和“显式写 0”，所以必须在创建段时预置。
@@ -129,14 +156,9 @@ func (d PwrDevice) withDefaults() PwrDevice {
 	if d.Baud <= 0 {
 		d.Baud = defaultPwrBaud
 	}
-	if d.DataBits <= 0 {
-		d.DataBits = defaultPwrDataBits
-	}
+	d.DataBits = normalizeDataBits(d.DataBits)
 	d.StopBits = normalizeStopBits(d.StopBits)
-	d.Parity = strings.TrimSpace(d.Parity)
-	if d.Parity == "" {
-		d.Parity = defaultPwrParity
-	}
+	d.Parity = normalizeParity(d.Parity)
 	return d
 }
 
@@ -214,6 +236,9 @@ func (a *App) SavePwrDevices(devices []PwrDevice) error {
 	sb.WriteString(";   PWR-ON-ENTER / PWR-OFF-ENTER = 发送后是否追加回车（1/0）\n\n")
 
 	for _, device := range devices {
+		// 落盘前先补齐缺省值：零值设备（手工构造、或老界面传来的 4 字段）不能把
+		// BAUD=0/DATA=0 写进文件，否则文件本身就不可读了，只能靠解析时兜底。
+		device = device.withDefaults()
 		name := strings.TrimSpace(device.Name)
 		if name == "" {
 			return fmt.Errorf("设备名称不能为空")
@@ -232,7 +257,7 @@ func (a *App) SavePwrDevices(devices []PwrDevice) error {
 		fmt.Fprintf(&sb, "BAUD=%d\n", device.Baud)
 		fmt.Fprintf(&sb, "DATA=%d\n", device.DataBits)
 		fmt.Fprintf(&sb, "STOP=%s\n", formatStopBitsText(device.StopBits))
-		fmt.Fprintf(&sb, "PARITY=%s\n", strings.TrimSpace(device.Parity))
+		fmt.Fprintf(&sb, "PARITY=%s\n", device.Parity)
 		fmt.Fprintf(&sb, "PWR-ON=%s\n", strings.TrimSpace(device.PowerOn))
 		fmt.Fprintf(&sb, "PWR-ON-HEX=%s\n", pwrBoolText(device.PowerOnHex))
 		fmt.Fprintf(&sb, "PWR-ON-ENTER=%s\n", pwrBoolText(device.PowerOnEnter))
