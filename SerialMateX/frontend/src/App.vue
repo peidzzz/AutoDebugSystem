@@ -828,6 +828,80 @@ const logWindowRef = ref<HTMLElement | null>(null);
 const rxCount = ref(0);
 const txCount = ref(0);
 
+// --- RX 行视图（与 receivedData 的终端缓冲并行）---
+// 行视图只负责"一行一条"的结构化展示：RX 按 \n 切行，TX（任务发出的命令）另起一行并打时间戳。
+// 它与下面的 receivedData 管道互不替代，Hex 显示仍然看 receivedData。
+interface LogLine { dir: 'rx' | 'tx'; text: string; time: string }
+const MAX_LOG_LINES = 2000;
+const transcript = ref<LogLine[]>([]);
+// 还没收到 \n 的尾巴：先按原样显示成一行，下一个 chunk 继续往后追加，避免半行被拆成两条
+let rxPendingLine = '';
+// 这条未换行的 RX 行显示在 transcript 的哪一行上（-1 = 当前没有未换行的行）
+let rxOpenIdx = -1;
+// 单行最长字符数：下位机长时间不换行时只保留尾部，避免一条行无限增长拖垮渲染
+const MAX_LOG_LINE_CHARS = 4096;
+
+const nowHms = (): string => new Date().toTimeString().slice(0, 8);
+
+const appendLogLine = (dir: 'rx' | 'tx', text: string, time = '') => {
+  transcript.value.push({ dir, text, time });
+  if (transcript.value.length > MAX_LOG_LINES) {
+    const dropped = transcript.value.length - MAX_LOG_LINES;
+    transcript.value.splice(0, dropped);
+    // 超长裁剪会挪动下标：未换行的行跟着前移，被裁掉时视为已收尾
+    if (rxOpenIdx >= 0) rxOpenIdx = Math.max(-1, rxOpenIdx - dropped);
+  }
+};
+
+const pushRxChunk = (chunk: string) => {
+  if (!chunk) return;
+  const segments = (rxPendingLine + chunk).split('\n');
+  rxPendingLine = segments.pop() ?? '';
+  // 每行去掉 CRLF 里的 \r，行视图不需要这个控制字符
+  const lines = segments.map((s) => s.replace(/\r$/, ''));
+
+  // 上一块没换行的内容已经显示出来了：它的收尾就是这一行，用拼接后的完整内容替换它，
+  // 而不是再起一行（TX 行插在中间时下标不在末尾，同样按行号替换，不会重复显示）
+  if (rxOpenIdx >= 0 && lines.length > 0) {
+    transcript.value[rxOpenIdx].text = lines.shift()!;
+    rxOpenIdx = -1;
+  }
+  for (const line of lines) appendLogLine('rx', line);
+
+  // 极端情况：一直不换行时只保留尾部（可见行同步成同一份文本，不会重复）
+  if (rxPendingLine.length > MAX_LOG_LINE_CHARS) {
+    rxPendingLine = rxPendingLine.slice(-MAX_LOG_LINE_CHARS);
+  }
+
+  if (rxPendingLine) {
+    // 尾巴先显示出来（下位机提示符常常不带换行），下一次 chunk 接着往后追加
+    if (rxOpenIdx >= 0) {
+      transcript.value[rxOpenIdx].text = rxPendingLine;
+    } else {
+      appendLogLine('rx', rxPendingLine);
+      rxOpenIdx = transcript.value.length - 1;
+    }
+  } else {
+    rxOpenIdx = -1;
+  }
+  scrollLogToEnd();
+};
+
+const pushTxLine = (text: string, time?: string) => {
+  // 未换行的 RX 行原样留在上面（只是后面多了这一条 TX），后面的 RX 继续按行号续写它，
+  // 所以这里不用动 pending，也不会把同一段文字显示两遍
+  appendLogLine('tx', text, time || nowHms());
+  scrollLogToEnd();
+};
+
+// 滚到底：只在"自动滚屏"打开时生效，等 DOM 更新完再设 scrollTop
+const scrollLogToEnd = () => {
+  if (!autoScroll.value) return;
+  nextTick(() => {
+    if (logWindowRef.value) logWindowRef.value.scrollTop = logWindowRef.value.scrollHeight;
+  });
+};
+
 // --- Charting State ---
 const showChart = ref(false);
 // We'll store series data here. Map<seriesIndex, [timestamp, value][]>
@@ -1320,9 +1394,14 @@ const startProcessingLoop = () => {
             // 3. 更新 receivedData (显示文本)
             if (showHex.value) {
                  receivedData.value += formatData(consolidatedBytes, true);
+                 // Hex 视图下也继续维护行视图，否则切回文本时这段接收内容会凭空消失
+                 pushRxChunk(formatData(consolidatedBytes, false));
             } else {
                  // 文本模式按终端语义累加：退格删字符、CR/LF 归一、其余控制字符丢弃
-                 receivedData.value = applyTerminalChars(receivedData.value, formatData(consolidatedBytes, false));
+                 const textChunk = formatData(consolidatedBytes, false);
+                 receivedData.value = applyTerminalChars(receivedData.value, textChunk);
+                 // 行视图与终端缓冲并行维护：同一批字节只解码一次，两个视图互不替代
+                 pushRxChunk(textChunk);
             }
             
             // 截断
@@ -1382,6 +1461,12 @@ onMounted(async () => {
 
   // 启动处理循环
   startProcessingLoop();
+
+  // 任务发出的 TX 命令：另起一行显示（后端已去掉行尾 CR/LF，time 是发送时刻 HH:MM:SS）
+  EventsOn("task-tx", (data: any) => {
+    if (!data) return;
+    pushTxLine(String(data.text ?? ''), String(data.time ?? ''));
+  });
 
   EventsOn("serial-error", (err) => {
     console.error("Connection error:", err);
@@ -1562,8 +1647,12 @@ const onRxKeydown = async (e: KeyboardEvent) => {
 
   // Ctrl+C：有选中文本时是“复制”，交给浏览器；没有选中才当作打断发送 0x03
   if (e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'c' || e.key === 'C')) {
-    const el = e.target as HTMLTextAreaElement | null;
-    const hasSelection = !!el && el.selectionStart !== el.selectionEnd;
+    // 行视图是普通 div，没有 selectionStart；textarea（Hex 视图）里选中的文字也不进
+    // window.getSelection()，所以两种元素分开判断
+    const el = e.target as HTMLElement | null;
+    const hasSelection = el instanceof HTMLTextAreaElement
+      ? el.selectionStart !== el.selectionEnd
+      : !!window.getSelection()?.toString();
     if (hasSelection) return;
     e.preventDefault();
     rxLineBuffer.value = '';
@@ -1675,7 +1764,10 @@ const clearReceive = () => {
   receivedData.value = '';
   rawDataBuffer.value = [];
   rxCount.value = 0;
-  
+  // 行视图也要一起清，否则清空后旧行还挂在屏幕上
+  transcript.value = [];
+  rxPendingLine = '';
+  rxOpenIdx = -1;
   // 清除之前的定时器（如果存在）
   if (broomAnimationTimer) {
     clearTimeout(broomAnimationTimer);
@@ -1702,12 +1794,8 @@ watch(showHex, () => {
   receivedData.value = formatData(rawDataBuffer.value, showHex.value);
 });
 
-const scrollToBottom = () => {
-  if (!autoScroll.value || !logWindowRef.value) return;
-  nextTick(() => {
-    if(logWindowRef.value) logWindowRef.value.scrollTop = logWindowRef.value.scrollHeight;
-  });
-};
+// 旧调用点（终端键入 / TX 发送后）沿用同一套滚到底逻辑，行视图和 Hex 视图都适用
+const scrollToBottom = () => scrollLogToEnd();
 </script>
 
 <template>
@@ -2140,6 +2228,17 @@ const scrollToBottom = () => {
 
         <div v-if="showChart" class="chart-wrap">
           <v-chart class="chart" :option="chartOption" autoresize />
+        </div>
+        <!-- 文本模式：行视图（RX 逐行、TX 绿色带时间戳）；Hex 模式回到字节 dump -->
+        <div v-else-if="!showHex"
+             ref="logWindowRef"
+             class="rx-log custom-scrollbar"
+             tabindex="0"
+             @keydown="onRxKeydown"
+             @paste="onRxPaste">
+          <!-- 空态提示：等价于原来 textarea 的 placeholder，行视图是 div 用不了 ::placeholder -->
+          <div v-if="!transcript.length" class="rx-empty">点击这里后直接键入即可发送（Enter 发单个回车、↑/↓ 翻历史、Backspace 发 0x7F、Ctrl+C 中断；选中文本可 Ctrl+C 复制，Ctrl+V 直接发给下位机）</div>
+          <div v-for="(line, i) in transcript" :key="i" class="rx-line" :class="{ 'is-tx': line.dir === 'tx' }"><span v-if="line.dir === 'tx'" class="rx-tag">{{ line.time }}</span>{{ line.text }}</div>
         </div>
         <textarea v-else
                   ref="logWindowRef"
@@ -3366,6 +3465,34 @@ const scrollToBottom = () => {
   cursor: text;
 }
 .rx-text::placeholder { color: var(--text-sub); opacity: 0.82; }
+
+/* 行视图：RX 逐行铺开，TX（任务发出的命令）用主色加粗并带发送时间；Hex 模式仍用上面的 .rx-text */
+.rx-log {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow: auto;
+  background: color-mix(in srgb, var(--field) 62%, var(--card));
+  padding: 12px 16px;
+  border: 0;
+  outline: none;
+  color: var(--text-main);
+  font-family: "Cascadia Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 1.72;
+  cursor: text;
+  /* 根节点是 select-none（避免拖窗口时选中整页），接收区要能选文字才能 Ctrl+C 复制 */
+  -webkit-user-select: text;
+  user-select: text;
+}
+.rx-line {
+  min-height: 1.72em; /* 空行也要占一行高度，否则接收里的空行会被吃掉 */
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.rx-line.is-tx { color: var(--col-primary); font-weight: 600; }
+.rx-tag { opacity: .55; margin-right: 8px; font-size: 10.5px; }
+.rx-empty { color: var(--text-sub); opacity: .82; }
 .chart-wrap { flex: 1; min-height: 0; padding: 8px; }
 .chart { width: 100%; height: 100%; }
 
