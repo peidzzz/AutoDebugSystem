@@ -28,7 +28,7 @@ use([
 provide(THEME_KEY, 'dark'); // Or dynamics based on app theme
 
 // 引入后端方法 (GetVersion, CheckForUpdates, DownloadAndInstallUpdate, QuitApp)
-import { GetSerialPorts, OpenSerial, OpenTcpClient, OpenTcpServer, OpenUdp, Close as CloseConnection, SendData, GetVersion, CheckForUpdates, DownloadAndInstallUpdate, QuitApp, GetPwrDevices, GetPwrDevPath, SavePwrDevices, GetTaskConfig, SaveTaskConfig, GetTaskCfgPath, GetAutoCmds, SaveAutoCmds, GetAutoCmdPath, StartTask, StopTask, ResumeTask, GetTaskRuntime, ImportAutoCmds } from '../wailsjs/go/main/App';
+import { GetSerialPorts, OpenSerial, OpenTcpClient, OpenTcpServer, OpenUdp, Close as CloseConnection, SendData, GetVersion, CheckForUpdates, DownloadAndInstallUpdate, QuitApp, GetPwrDevices, GetPwrDevPath, SavePwrDevices, GetTaskConfig, SaveTaskConfig, GetTaskCfgPath, GetAutoCmds, SaveAutoCmds, GetAutoCmdPath, StartTask, StopTask, EndTask, SkipRound, GetTaskRuntime, ImportAutoCmds } from '../wailsjs/go/main/App';
 import { EventsOn } from '../wailsjs/runtime/runtime';
 import { shallowRef } from 'vue';
 
@@ -304,6 +304,8 @@ const taskCfgPath = ref('');
 interface TaskRuntimeModel {
   running: boolean;
   paused: boolean;
+  // 暂停原因："abnormal" 表示有命令没跑完；空串表示没暂停
+  pausedReason: string;
   round: number;
   runCount: number;
   normalCount: number;
@@ -322,6 +324,7 @@ interface TaskRuntimeModel {
 const emptyRuntime = (): TaskRuntimeModel => ({
   running: false,
   paused: false,
+  pausedReason: '',
   round: 0,
   runCount: 0,
   normalCount: 0,
@@ -703,10 +706,17 @@ const toggleAutoRun = async () => {
   startTaskPolling();
 };
 
-// 异常暂停后继续
-const resumeTask = async () => {
-  const res = await ResumeTask();
-  if (res) showModal('继续失败', res, 'error');
+// 异常暂停后的两条出路：结束任务（掉电并收工） / 跳过本轮（掉电，等间隔后继续下一轮）
+const endTask = async () => {
+  const res = await EndTask();
+  if (res) showModal('结束任务失败', res, 'error');
+  await pollTaskRuntime();
+};
+
+const skipRound = async () => {
+  const res = await SkipRound();
+  if (res) showModal('跳过本轮失败', res, 'error');
+  await pollTaskRuntime();
 };
 
 // 网络参数
@@ -2076,7 +2086,10 @@ const scrollToBottom = () => {
               <span class="setting-label">当前电流</span>
               <span class="chip is-off">NULL<span class="chip-unit">A</span></span>
             </div>
-            <button v-if="taskRt.paused" @click="resumeTask" class="btn btn-warn btn-block">继续（解除异常暂停）</button>
+            <div v-if="taskRt.paused" class="paused-note">
+              <span class="paused-note__dot"></span>
+              <span>已暂停 · 有命令未执行完</span>
+            </div>
           </div>
         </section>
       </div>
@@ -2234,37 +2247,43 @@ const scrollToBottom = () => {
         </div>
       </div>
 
-      <!-- 底部：启动 / 停止（运行中沿边框均匀顺时针流光，停止时外圈呼吸灯） -->
-      <div class="run-foot">
-        <div class="run-ring" :class="taskRt.running ? 'run-ring--running' : 'run-ring--idle'">
-          <!-- 流光用 SVG 描边 + pathLength 归一化：整圈按弧长匀速跑，长短边不会有快慢差 -->
-          <svg v-if="taskRt.running" class="run-ring__svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
-            <defs>
-              <linearGradient id="runRingGrad" x1="0" y1="0" x2="1" y2="1">
-                <stop offset="0%" stop-color="rgba(255,255,255,0.35)" />
-                <stop offset="45%" stop-color="var(--col-primary)" />
-                <stop offset="100%" stop-color="#ffffff" />
-              </linearGradient>
-            </defs>
-            <!-- 底圈：让边框始终是“一圈环”，不至于在暗处看不见 -->
-            <rect x="1.5" y="1.5" width="97" height="97" rx="6" ry="6" fill="none"
-                  stroke="rgba(255,255,255,0.30)" stroke-width="2.5" vector-effect="non-scaling-stroke" />
-            <!-- 高光段：沿整圈匀速流动 -->
-            <rect x="1.5" y="1.5" width="97" height="97" rx="6" ry="6" fill="none"
-                  stroke="url(#runRingGrad)" stroke-width="2.5" stroke-linecap="round"
-                  pathLength="100" stroke-dasharray="20 80" vector-effect="non-scaling-stroke"
-                  class="run-ring__dash" />
-          </svg>
-          <button @click="toggleAutoRun"
-                  :disabled="!taskRt.running && !canStartTask"
-                  class="run-btn"
-                  :class="[
-                    taskRt.running ? 'is-running' : '',
-                    !taskRt.running && !canStartTask ? 'is-disabled' : ''
-                  ]"
-                  :title="!taskRt.running && !canStartTask ? '请先在 SERIAL 页连接 COM 口' : (taskRt.running ? '停止任务' : '开始任务')">
-            {{ taskRt.running ? '停止' : '启动' }}
-          </button>
+      <!-- 底部：启动 / 停止（运行中沿边框均匀顺时针流光，停止时外圈呼吸灯）；异常暂停时改为两条出路 -->
+      <div class="run-foot" :class="{ 'run-foot--paused': taskRt.paused }">
+        <div class="run-ring" :class="taskRt.paused ? 'run-ring--paused' : (taskRt.running ? 'run-ring--running' : 'run-ring--idle')">
+          <template v-if="taskRt.paused">
+            <button @click="endTask" class="btn btn-warn" title="结束任务：掉电并结束整个任务">结束任务</button>
+            <button @click="skipRound" class="btn btn-primary" title="跳过本轮：本轮流不计数，掉电后等间隔再跑下一轮">跳过本轮</button>
+          </template>
+          <template v-else>
+            <!-- 流光用 SVG 描边 + pathLength 归一化：整圈按弧长匀速跑，长短边不会有快慢差 -->
+            <svg v-if="taskRt.running" class="run-ring__svg" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+              <defs>
+                <linearGradient id="runRingGrad" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0%" stop-color="rgba(255,255,255,0.35)" />
+                  <stop offset="45%" stop-color="var(--col-primary)" />
+                  <stop offset="100%" stop-color="#ffffff" />
+                </linearGradient>
+              </defs>
+              <!-- 底圈：让边框始终是“一圈环”，不至于在暗处看不见 -->
+              <rect x="1.5" y="1.5" width="97" height="97" rx="6" ry="6" fill="none"
+                    stroke="rgba(255,255,255,0.30)" stroke-width="2.5" vector-effect="non-scaling-stroke" />
+              <!-- 高光段：沿整圈匀速流动 -->
+              <rect x="1.5" y="1.5" width="97" height="97" rx="6" ry="6" fill="none"
+                    stroke="url(#runRingGrad)" stroke-width="2.5" stroke-linecap="round"
+                    pathLength="100" stroke-dasharray="20 80" vector-effect="non-scaling-stroke"
+                    class="run-ring__dash" />
+            </svg>
+            <button @click="toggleAutoRun"
+                    :disabled="!taskRt.running && !canStartTask"
+                    class="run-btn"
+                    :class="[
+                      taskRt.running ? 'is-running' : '',
+                      !taskRt.running && !canStartTask ? 'is-disabled' : ''
+                    ]"
+                    :title="!taskRt.running && !canStartTask ? '请先在 SERIAL 页连接 COM 口' : (taskRt.running ? '停止任务' : '开始任务')">
+              {{ taskRt.running ? '停止' : '启动' }}
+            </button>
+          </template>
         </div>
       </div>
     </aside>
@@ -3090,6 +3109,38 @@ const scrollToBottom = () => {
   background: rgba(63, 125, 91, 0.12);
   border-color: rgba(63, 125, 91, 0.32);
 }
+/* 异常暂停提示：整行横幅，避免长句被状态列的窄格裁掉 */
+.paused-note {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding: 5px 8px;
+  border: 1px solid color-mix(in srgb, var(--col-error) 30%, transparent);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--col-error) 8%, transparent);
+  color: var(--col-error);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1.35;
+}
+.paused-note__dot {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--col-error);
+  animation: dot-pulse 1.8s ease-in-out infinite;
+}
+.status-pill.is-warn {
+  color: var(--col-error);
+  background: color-mix(in srgb, var(--col-error) 10%, transparent);
+  border-color: color-mix(in srgb, var(--col-error) 34%, transparent);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 3px 7px;
+}
 
 /* ---------------- 按钮 ---------------- */
 .btn {
@@ -3505,6 +3556,31 @@ const scrollToBottom = () => {
   box-shadow: 0 0 12px color-mix(in srgb, var(--col-primary) 30%, transparent);
 }
 .run-ring--running::before { background: color-mix(in srgb, var(--col-primary) 10%, transparent); }
+/* 异常暂停：外框换成静态描边（不呼吸、不流光），里面并排“结束任务 / 跳过本轮” */
+.run-ring--paused {
+  box-sizing: border-box;
+  border: 1px solid color-mix(in srgb, var(--col-error) 36%, transparent);
+  box-shadow: none;
+  animation: none;
+}
+.run-ring--paused::before {
+  background: color-mix(in srgb, var(--col-error) 7%, transparent);
+  animation: none;
+}
+.run-foot--paused .run-ring {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+}
+.run-foot--paused .btn {
+  position: relative;
+  z-index: 1;
+  height: 42px;
+  border-radius: 9px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
 .run-ring__svg {
   position: absolute;
   inset: 0;
