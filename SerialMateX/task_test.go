@@ -777,6 +777,20 @@ func TestTaskPauseStopDoesNotHang(t *testing.T) {
 	waitPwrClosed(t, port)
 }
 
+// readTaskLog 读回本次运行生成的任务日志（SaveLog=1 的 fixture 只生成一个文件）。
+func readTaskLog(t *testing.T) string {
+	t.Helper()
+	logs, err := filepath.Glob(filepath.Join(os.Getenv("SERIALMATEX_LOGDIR"), "DEBUGLOG_*.log"))
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("应生成 1 个日志文件: %v %v", logs, err)
+	}
+	raw, err := os.ReadFile(logs[0])
+	if err != nil {
+		t.Fatalf("读日志失败: %v", err)
+	}
+	return string(raw)
+}
+
 // TestTaskTxLogLine 任务发出的每条命令都要在日志里留一行 “[TX 时:分:秒] 正文”，
 // 并且前后各恰好一个换行：RX 数据不带换行时 TX 行也不能粘在它后面。
 func TestTaskTxLogLine(t *testing.T) {
@@ -849,6 +863,125 @@ func TestTaskTxLogLine(t *testing.T) {
 	// RX 数据确实紧挨着第一行 TX，中间只隔一个换行。
 	if !strings.HasSuffix(text[:strings.Index(text, lines[0])], "ready\n") {
 		t.Fatalf("RX 数据与 TX 行之间不是恰好一个换行: %q", text)
+	}
+}
+
+// TestTaskTxLogLineStripsEOL 默认 enter=1 时设备照收结尾的 CR，但日志行只留正文：
+// 行里不能带 \r，也不能因为“正文自带换行”而变成两行。
+func TestTaskTxLogLineStripsEOL(t *testing.T) {
+	writeTaskFixtures(t,
+		"[Task]\nSaveLog=1\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+		"TX AT+OK 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	var sent string
+	taskSendHook = func(s string) string { sent = s; return "Sent" }
+	defer func() { taskSendHook = nil }()
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if rt.NormalCount != 1 {
+		t.Fatalf("一轮应算正常: normal=%d msg=%s", rt.NormalCount, rt.Message)
+	}
+
+	// 线上发的仍是带 Enter 的原始字节，裁剪只发生在日志/事件里。
+	if sent != "AT+OK\r" {
+		t.Fatalf("发给设备的字节不该被裁剪: %q", sent)
+	}
+
+	text := readTaskLog(t)
+	if strings.Contains(text, "\r") {
+		t.Fatalf("日志里不该出现 \\r: %q", text)
+	}
+	idx := strings.Index(text, "[TX ")
+	if idx < 0 {
+		t.Fatalf("日志里没有 TX 行: %q", text)
+	}
+	if idx == 0 || text[idx-1] != '\n' {
+		t.Fatalf("TX 行前面没有换行: %q", text)
+	}
+	nl := strings.IndexByte(text[idx:], '\n')
+	if nl < 0 {
+		t.Fatalf("TX 行后面没有换行: %q", text)
+	}
+	line := text[idx : idx+nl]
+	if !regexp.MustCompile(`^\[TX \d{2}:\d{2}:\d{2}\] AT\+OK$`).MatchString(line) {
+		t.Fatalf("TX 行应只留正文且不带回车: %q", line)
+	}
+}
+
+// TestTaskTxNoLineWhenSendFails 发送失败不留 TX 行：日志只记录真正发出去的字节。
+func TestTaskTxNoLineWhenSendFails(t *testing.T) {
+	writeTaskFixtures(t,
+		"[Task]\nSaveLog=1\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+		"TX AT+OK 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	attempts := 0
+	taskSendHook = func(string) string { attempts++; return "Error: 串口已断开" }
+	defer func() { taskSendHook = nil }()
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if attempts != 1 {
+		t.Fatalf("应尝试发送 1 次: %d", attempts)
+	}
+	if rt.NormalCount != 0 {
+		t.Fatalf("发送失败的一轮不能算正常: normal=%d", rt.NormalCount)
+	}
+	if text := readTaskLog(t); strings.Contains(text, "[TX ") {
+		t.Fatalf("发送失败不该记 TX 行: %q", text)
+	}
+}
+
+// TestTaskPauseSkipLastRound 最后一轮被跳过：电源照样掉电，任务以“跳过”为原因结束，
+// 不能报成“任务完成”（那一轮并没有正常跑完）。
+func TestTaskPauseSkipLastRound(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=1\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+		"RX never 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	waitTaskPaused(t, app, 10*time.Second)
+	if msg := app.SkipRound(); msg != "" {
+		t.Fatalf("跳过本轮失败: %s", msg)
+	}
+
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if rt.Round != 1 {
+		t.Fatalf("最后一轮被跳过，不能凭空多跑一轮: round=%d", rt.Round)
+	}
+	if rt.NormalCount != 0 {
+		t.Fatalf("被跳过的一轮不能算正常: normal=%d", rt.NormalCount)
+	}
+	if !strings.Contains(rt.Message, "已跳过最后一轮") {
+		t.Fatalf("最后一轮被跳过时结束原因不对: %q", rt.Message)
+	}
+	waitPwrClosed(t, port)
+
+	// 上电 → 跳过时掉电（没有下一轮上电）
+	writes := port.written()
+	want := [][]byte{{0x01}, {0x00}}
+	if len(writes) != len(want) {
+		t.Fatalf("电源写入次数不对: %q", writes)
+	}
+	for i := range want {
+		if !bytes.Equal(writes[i], want[i]) {
+			t.Fatalf("电源写入不对: %q", writes)
+		}
 	}
 }
 

@@ -50,6 +50,7 @@ type TaskRuntime struct {
 // taskEngine 持有运行状态与串口送来的数据。
 type taskEngine struct {
 	mu       sync.Mutex
+	logMu    sync.Mutex // 串行化任务日志的写入（任务 goroutine 与读串口 goroutine 并发写）
 	rt       TaskRuntime
 	stopCh   chan struct{}
 	decision chan string     // 异常暂停时的决定："end" 结束任务 / "skip" 跳过本轮
@@ -137,21 +138,16 @@ func (a *App) StopTask() string {
 	if paused && decision != nil {
 		select {
 		case decision <- "end":
+			// 投递成功也顺手关掉 stopCh：万一 runTask 刚好在这几微秒里结束了暂停，
+			// 这次“停止”依然会生效。
+			t.closeStop()
 			return ""
 		default:
 		}
 		// 通道里已经有一个决定（连点了两下），或者暂停刚好结束：
 		// 退回普通停止路径，关掉 stopCh 两边都能兜住，这次点击不会丢。
 	}
-	t.mu.Lock()
-	if t.stopCh != nil {
-		select {
-		case <-t.stopCh:
-		default:
-			close(t.stopCh)
-		}
-	}
-	t.mu.Unlock()
+	t.closeStop()
 	return ""
 }
 
@@ -160,10 +156,14 @@ func (a *App) EndTask() string {
 	if !a.postPauseDecision("end") {
 		return "当前不在异常暂停状态"
 	}
+	// 投递成功也关掉 stopCh：暂停恰好结束的极小窗口里，这次“结束”同样要生效。
+	a.task.closeStop()
 	return ""
 }
 
 // SkipRound 跳过本轮：掉电、照常走间隔倒计时，然后继续下一轮，但这一轮不计正常次数。
+// 这里不能像 EndTask 那样顺手关 stopCh：runTask 在间隔前会检查 stopped()，
+// 关掉就会把“跳过”退化成“结束任务”。
 func (a *App) SkipRound() string {
 	if !a.postPauseDecision("skip") {
 		return "当前不在异常暂停状态"
@@ -204,6 +204,21 @@ func (a *App) postPauseDecision(action string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// closeStop 关闭 stopCh（已关闭则跳过）。暂停决定投递成功后也调用它，
+// 保证“结束 / 停止”在暂停刚好结束的极小窗口里同样生效。
+func (t *taskEngine) closeStop() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopCh == nil {
+		return
+	}
+	select {
+	case <-t.stopCh:
+	default:
+		close(t.stopCh)
 	}
 }
 
@@ -368,7 +383,7 @@ func (t *taskEngine) feed(data []byte) {
 	t.mu.Unlock()
 
 	if logPath != "" {
-		appendFile(logPath, string(data))
+		t.appendTaskLog(logPath, string(data))
 	}
 }
 
@@ -382,18 +397,35 @@ func appendFile(path, text string) {
 	_ = f.Close()
 }
 
-// appendTxLog 把任务发出的一条 TX 命令记进日志：[TX 15:04:05] 正文。
-// 前后各用恰好一个换行夹住：日志里的 RX 数据可能不带换行（甚至什么都还没写），
-// 不加前置换行就会把 TX 行粘在上一段 RX 字节后面。
-func (t *taskEngine) appendTxLog(logPath, text string) {
+// appendTaskLog 是任务日志的统一写入口：日志按“打开 → 追加 → 关闭”写，
+// 任务 goroutine（横幅 / TX 行）和读串口 goroutine（RX 数据）会并发写同一个文件，
+// 必须用 logMu 串行化，否则两段内容会交错。
+func (t *taskEngine) appendTaskLog(logPath, text string) {
 	if logPath == "" {
 		return
 	}
+	t.logMu.Lock()
+	defer t.logMu.Unlock()
+	appendFile(logPath, text)
+}
+
+// appendTxLog 把任务发出的一条 TX 命令记进日志：[TX 15:04:05] 正文。
+// 前后各用恰好一个换行夹住：日志里的 RX 数据可能不带换行（甚至什么都还没写），
+// 不加前置换行就会把 TX 行粘在上一段 RX 字节后面。
+// at 由调用方统一取一次时间，保证日志行和 task-tx 事件的时间一致。
+func (t *taskEngine) appendTxLog(logPath, at, text string) {
+	if logPath == "" {
+		return
+	}
+	// “看最后一个字节 + 追加”必须在同一把锁里完成，否则 RX 数据可能插在中间，
+	// 前置换行就白算了（会得到 ...\nOK[TX ...] 这种粘在一起的日志）。
+	t.logMu.Lock()
+	defer t.logMu.Unlock()
 	prefix := ""
 	if last, ok := lastFileByte(logPath); ok && last != '\n' {
 		prefix = "\n"
 	}
-	appendFile(logPath, prefix+"[TX "+time.Now().Format("15:04:05")+"] "+text+"\n")
+	appendFile(logPath, prefix+"[TX "+at+"] "+text+"\n")
 }
 
 // lastFileByte 读文件的最后一个字节，用来判断日志是否已经以换行结尾。
@@ -535,9 +567,7 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 		// 上电：第一轮若“初始状态”为开，则不发 ON 命令，直接进入运行。
 		if round == 1 && cfg.InitialState {
 			t.set(func(rt *TaskRuntime) { rt.PowerOn = true })
-			if logPath != "" {
-				appendFile(logPath, taskLogBanner("第 "+strconv.Itoa(round)+" 次上电", device.Name))
-			}
+			t.appendTaskLog(logPath, taskLogBanner("第 "+strconv.Itoa(round)+" 次上电", device.Name))
 		} else if err := a.sendBytes(device.PowerOn, device.PowerOnHex, device.PowerOnEnter); err != nil {
 			failMsg = "上电失败：" + err.Error()
 			t.set(func(rt *TaskRuntime) { rt.Message = failMsg })
@@ -545,9 +575,7 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			break
 		} else {
 			t.set(func(rt *TaskRuntime) { rt.PowerOn = true })
-			if logPath != "" {
-				appendFile(logPath, taskLogBanner("第 "+strconv.Itoa(round)+" 次上电", device.Name))
-			}
+			t.appendTaskLog(logPath, taskLogBanner("第 "+strconv.Itoa(round)+" 次上电", device.Name))
 		}
 
 		if csvPath != "" {
@@ -606,13 +634,13 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			t.set(func(rt *TaskRuntime) { rt.Message = failMsg })
 		}
 		if logPath != "" {
-			appendFile(logPath, taskLogBanner("第 "+strconv.Itoa(round)+" 次测试停止", device.Name))
+			t.appendTaskLog(logPath, taskLogBanner("第 "+strconv.Itoa(round)+" 次测试停止", device.Name))
 		}
 		if stopCsv != nil {
 			stopCsv()
 			stopCsv = nil
 		}
-		if complete && offErr == nil && !skipRound {
+		if complete && offErr == nil {
 			t.set(func(rt *TaskRuntime) { rt.NormalCount++ })
 		}
 		if offErr != nil {
@@ -622,6 +650,11 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 		if endRequested {
 			aborted = true
 			endMsg = "已手动结束"
+			break
+		}
+		// 最后一轮被跳过：没有下一轮可跑，明确告诉用户任务是因为“跳过”而结束的。
+		if skipRound && round == cfg.RunCount {
+			endMsg = "已跳过最后一轮，任务结束"
 			break
 		}
 
@@ -705,12 +738,15 @@ func (a *App) runCommands(cmds []AutoCmd, deadline time.Time) bool {
 				return false
 			}
 			// 发送成功才记录：日志里留一行 [TX 时:分:秒] 正文，同时推给界面高亮显示。
-			// 两边用同一个字符串（编码后真正发出去的文本），界面看到的就是设备收到的内容。
+			// 日志行与事件用同一个字符串（编码后真正发出去的文本，去掉行尾的 \r/\n：
+			// 命令的 Enter 是发给设备的，不该破坏按行阅读的日志），时间也只取一次。
+			logText := strings.TrimRight(text, "\r\n")
+			at := time.Now().Format("15:04:05")
 			t.mu.Lock()
 			logPath := t.logPath
 			t.mu.Unlock()
-			t.appendTxLog(logPath, text)
-			a.emitTaskTx(text)
+			t.appendTxLog(logPath, at, logText)
+			a.emitTaskTx(at, logText)
 		}
 
 		// 执行完成后高亮数字并倒计时。
