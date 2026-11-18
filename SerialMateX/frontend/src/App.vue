@@ -831,20 +831,30 @@ const txCount = ref(0);
 // --- RX 行视图（与 receivedData 的终端缓冲并行）---
 // 行视图只负责"一行一条"的结构化展示：RX 按 \n 切行，TX（任务发出的命令）另起一行并打时间戳。
 // 它与下面的 receivedData 管道互不替代，Hex 显示仍然看 receivedData。
-interface LogLine { dir: 'rx' | 'tx'; text: string; time: string }
+interface LogLine { id: number; dir: 'rx' | 'tx'; text: string; time: string }
 const MAX_LOG_LINES = 2000;
 const transcript = ref<LogLine[]>([]);
+// 单调递增的行号：到 2000 行上限开始裁剪时 :key 不会整体错位（否则整表每行都要重新 patch）
+let logSeq = 0;
 // 还没收到 \n 的尾巴：先按原样显示成一行，下一个 chunk 继续往后追加，避免半行被拆成两条
 let rxPendingLine = '';
 // 这条未换行的 RX 行显示在 transcript 的哪一行上（-1 = 当前没有未换行的行）
 let rxOpenIdx = -1;
 // 单行最长字符数：下位机长时间不换行时只保留尾部，避免一条行无限增长拖垮渲染
 const MAX_LOG_LINE_CHARS = 4096;
+// 行视图用自己的解码器：receivedData 那支是流式状态（{stream:true}），两边共用一个会互相推进多字节状态
+const lineDecoder = new TextDecoder('utf-8');
+// 接收区空态提示：行视图是 div，用不了 ::placeholder，Hex 的 textarea 复用同一句话
+const RX_HINT = '点击这里后直接键入即可发送（Enter 发单个回车、↑/↓ 翻历史、Backspace 发 0x7F、Ctrl+C 中断；选中文本可 Ctrl+C 复制、Ctrl+V 直接发给下位机）';
 
 const nowHms = (): string => new Date().toTimeString().slice(0, 8);
 
+// 超长行只保留尾部：完整行和未换行的尾巴都走这里，避免单行无限增长拖垮渲染
+const clampLineText = (text: string): string =>
+  text.length > MAX_LOG_LINE_CHARS ? text.slice(-MAX_LOG_LINE_CHARS) : text;
+
 const appendLogLine = (dir: 'rx' | 'tx', text: string, time = '') => {
-  transcript.value.push({ dir, text, time });
+  transcript.value.push({ id: ++logSeq, dir, text: clampLineText(text), time });
   if (transcript.value.length > MAX_LOG_LINES) {
     const dropped = transcript.value.length - MAX_LOG_LINES;
     transcript.value.splice(0, dropped);
@@ -863,15 +873,13 @@ const pushRxChunk = (chunk: string) => {
   // 上一块没换行的内容已经显示出来了：它的收尾就是这一行，用拼接后的完整内容替换它，
   // 而不是再起一行（TX 行插在中间时下标不在末尾，同样按行号替换，不会重复显示）
   if (rxOpenIdx >= 0 && lines.length > 0) {
-    transcript.value[rxOpenIdx].text = lines.shift()!;
+    transcript.value[rxOpenIdx].text = clampLineText(lines.shift()!);
     rxOpenIdx = -1;
   }
   for (const line of lines) appendLogLine('rx', line);
 
   // 极端情况：一直不换行时只保留尾部（可见行同步成同一份文本，不会重复）
-  if (rxPendingLine.length > MAX_LOG_LINE_CHARS) {
-    rxPendingLine = rxPendingLine.slice(-MAX_LOG_LINE_CHARS);
-  }
+  rxPendingLine = clampLineText(rxPendingLine);
 
   if (rxPendingLine) {
     // 尾巴先显示出来（下位机提示符常常不带换行），下一次 chunk 接着往后追加
@@ -884,7 +892,7 @@ const pushRxChunk = (chunk: string) => {
   } else {
     rxOpenIdx = -1;
   }
-  scrollLogToEnd();
+  // 滚屏交给调用方：一批数据处理完只滚一次，这里不重复排 nextTick
 };
 
 const pushTxLine = (text: string, time?: string) => {
@@ -1351,6 +1359,66 @@ let animationFrameId: number | null = null;
 let lastProcessTime = 0;
 const PROCESS_INTERVAL = 30; // ms (approx 30fps)
 
+// 把队列里的数据一次性处理完，返回处理的字节数。
+// rAF 循环和 task-tx 之前的 drain 共用这一个函数：TX 行因此一定排在"它之前收到的" RX 之后，
+// 排序只有这一个来源，不需要第二条 TX 队列。
+const processIncomingBatch = (): number => {
+    if (incomingDataQueue.length === 0) return 0;
+
+    // 取出所有待处理数据
+    const batchChunks = incomingDataQueue.splice(0, incomingDataQueue.length);
+
+    // 计算总长度
+    let totalLen = 0;
+    for (const chunk of batchChunks) totalLen += chunk.length;
+    if (totalLen === 0) return 0;
+
+    // 合并为一个大数组
+    const consolidatedBytes = new Array(totalLen);
+    let offset = 0;
+    for (const chunk of batchChunks) {
+        for (let i = 0; i < chunk.length; i++) {
+            consolidatedBytes[offset++] = chunk[i];
+        }
+    }
+
+    try {
+        // 1. 绘图解析
+        parseAndPlot(consolidatedBytes);
+
+        // 2. 更新 rawDataBuffer
+        rawDataBuffer.value.push(...consolidatedBytes);
+        if (rawDataBuffer.value.length > MAX_BUFFER_SIZE) {
+             const overflow = rawDataBuffer.value.length - MAX_BUFFER_SIZE;
+             rawDataBuffer.value.splice(0, overflow);
+        }
+
+        // 3. 更新 receivedData (显示文本) 与行视图
+        // 行视图单独解码（自己的解码器实例，不推进 receivedData 的流式状态）；两种视图下都维护，
+        // 否则 Hex 期间收到的内容在切回文本时会凭空消失
+        const transcriptText = lineDecoder.decode(new Uint8Array(consolidatedBytes), { stream: true });
+        if (showHex.value) {
+             receivedData.value += formatData(consolidatedBytes, true);
+        } else {
+             // 文本模式按终端语义累加：退格删字符、CR/LF 归一、其余控制字符丢弃
+             receivedData.value = applyTerminalChars(receivedData.value, formatData(consolidatedBytes, false));
+        }
+        pushRxChunk(transcriptText);
+
+        // 截断
+        if (receivedData.value.length > MAX_BUFFER_SIZE) {
+            receivedData.value = receivedData.value.slice(receivedData.value.length - MAX_BUFFER_SIZE);
+        }
+
+        // 4. 更新计数
+        rxCount.value += totalLen;
+        return totalLen;
+    } catch (e) {
+        console.error("Error in processing loop:", e);
+        return 0;
+    }
+};
+
 const startProcessingLoop = () => {
     if (animationFrameId !== null) return;
     
@@ -1363,58 +1431,7 @@ const startProcessingLoop = () => {
         
         if (incomingDataQueue.length === 0) return;
         
-        // 取出所有待处理数据
-        const batchChunks = incomingDataQueue.splice(0, incomingDataQueue.length);
-        
-        // 计算总长度
-        let totalLen = 0;
-        for (const chunk of batchChunks) totalLen += chunk.length;
-        if (totalLen === 0) return;
-        
-        // 合并为一个大数组
-        const consolidatedBytes = new Array(totalLen);
-        let offset = 0;
-        for (const chunk of batchChunks) {
-            for (let i = 0; i < chunk.length; i++) {
-                consolidatedBytes[offset++] = chunk[i];
-            }
-        }
-        
-        try {
-            // 1. 绘图解析
-            parseAndPlot(consolidatedBytes);
-            
-            // 2. 更新 rawDataBuffer
-            rawDataBuffer.value.push(...consolidatedBytes);
-            if (rawDataBuffer.value.length > MAX_BUFFER_SIZE) {
-                 const overflow = rawDataBuffer.value.length - MAX_BUFFER_SIZE;
-                 rawDataBuffer.value.splice(0, overflow);
-            }
-            
-            // 3. 更新 receivedData (显示文本)
-            if (showHex.value) {
-                 receivedData.value += formatData(consolidatedBytes, true);
-                 // Hex 视图下也继续维护行视图，否则切回文本时这段接收内容会凭空消失
-                 pushRxChunk(formatData(consolidatedBytes, false));
-            } else {
-                 // 文本模式按终端语义累加：退格删字符、CR/LF 归一、其余控制字符丢弃
-                 const textChunk = formatData(consolidatedBytes, false);
-                 receivedData.value = applyTerminalChars(receivedData.value, textChunk);
-                 // 行视图与终端缓冲并行维护：同一批字节只解码一次，两个视图互不替代
-                 pushRxChunk(textChunk);
-            }
-            
-            // 截断
-            if (receivedData.value.length > MAX_BUFFER_SIZE) {
-                receivedData.value = receivedData.value.slice(receivedData.value.length - MAX_BUFFER_SIZE);
-            }
-            
-            // 4. 更新计数和滚动
-            rxCount.value += totalLen;
-            scrollToBottom();
-        } catch (e) {
-            console.error("Error in processing loop:", e);
-        }
+        if (processIncomingBatch() > 0) scrollToBottom();
     };
     
     animationFrameId = requestAnimationFrame(loop);
@@ -1462,9 +1479,15 @@ onMounted(async () => {
   // 启动处理循环
   startProcessingLoop();
 
+  // 接收区获焦时的粘贴兜底（见 onDocumentPaste）
+  document.addEventListener('paste', onDocumentPaste);
+
   // 任务发出的 TX 命令：另起一行显示（后端已去掉行尾 CR/LF，time 是发送时刻 HH:MM:SS）
   EventsOn("task-tx", (data: any) => {
     if (!data) return;
+    // 先把还压在队列里的 RX 处理掉再写这一行：rAF 循环 30ms 才跑一次，
+    // 不 drain 的话命令会显示在它之前到达的回复上面（GET TEMP / TEMP=25.1 的顺序就反了）
+    processIncomingBatch();
     pushTxLine(String(data.text ?? ''), String(data.time ?? ''));
   });
 
@@ -1491,6 +1514,7 @@ onUnmounted(() => {
     clearTimeout(broomAnimationTimer);
     broomAnimationTimer = null;
   }
+  document.removeEventListener('paste', onDocumentPaste);
   stopProcessingLoop();
   stopTaskPolling();
 });
@@ -1715,6 +1739,16 @@ const onRxPaste = async (e: ClipboardEvent) => {
   const payload = raw.replace(/\r\n/g, '\r').replace(/\n/g, '\r');
   rxLineBuffer.value += payload.replace(/\r/g, '');
   await sendRaw(payload);
+};
+
+// 行视图是普通 div，@paste 不一定收得到（不同内核/版本对非可编辑元素的路由不一样），
+// 所以再挂一层 document 监听兜底：只要焦点还在接收区里就按同样的方式粘贴即发送。
+// 元素自己的 @paste 已经 preventDefault 过，这里靠 defaultPrevented 去重，不会发两遍。
+const onDocumentPaste = (e: ClipboardEvent) => {
+  if (e.defaultPrevented) return;
+  const box = logWindowRef.value;
+  if (!box || !box.contains(document.activeElement)) return;
+  void onRxPaste(e);
 };
 
 // ===== TX EDITOR：编辑后回车发送，↑ / ↓ 翻历史 =====
@@ -2234,18 +2268,21 @@ const scrollToBottom = () => scrollLogToEnd();
              ref="logWindowRef"
              class="rx-log custom-scrollbar"
              tabindex="0"
+             role="textbox"
+             aria-multiline="true"
+             :aria-label="RX_HINT"
              @keydown="onRxKeydown"
              @paste="onRxPaste">
           <!-- 空态提示：等价于原来 textarea 的 placeholder，行视图是 div 用不了 ::placeholder -->
-          <div v-if="!transcript.length" class="rx-empty">点击这里后直接键入即可发送（Enter 发单个回车、↑/↓ 翻历史、Backspace 发 0x7F、Ctrl+C 中断；选中文本可 Ctrl+C 复制，Ctrl+V 直接发给下位机）</div>
-          <div v-for="(line, i) in transcript" :key="i" class="rx-line" :class="{ 'is-tx': line.dir === 'tx' }"><span v-if="line.dir === 'tx'" class="rx-tag">{{ line.time }}</span>{{ line.text }}</div>
+          <div v-if="!transcript.length" class="rx-empty">{{ RX_HINT }}</div>
+          <div v-for="line in transcript" :key="line.id" class="rx-line" :class="{ 'is-tx': line.dir === 'tx' }"><span v-if="line.dir === 'tx'" class="rx-tag">{{ line.time }}</span>{{ line.text }}</div>
         </div>
         <textarea v-else
                   ref="logWindowRef"
                   readonly
                   class="rx-text custom-scrollbar"
                   :value="receivedData"
-                  placeholder="点击这里后直接键入即可发送（Enter 发单个回车、↑/↓ 翻历史、Backspace 发 0x7F、Ctrl+C 中断；选中文本可 Ctrl+C 复制，Ctrl+V 直接发给下位机）"
+                  :placeholder="RX_HINT"
                   @keydown="onRxKeydown"
                   @paste="onRxPaste"></textarea>
       </section>
@@ -3492,7 +3529,13 @@ const scrollToBottom = () => scrollLogToEnd();
 }
 .rx-line.is-tx { color: var(--col-primary); font-weight: 600; }
 .rx-tag { opacity: .55; margin-right: 8px; font-size: 10.5px; }
-.rx-empty { color: var(--text-sub); opacity: .82; }
+.rx-empty {
+  color: var(--text-sub);
+  opacity: .82;
+  /* 空态提示不参与选择：否则日志为空时 Ctrl+A / Ctrl+C 会把它当成"有选中"而不发 0x03 */
+  -webkit-user-select: none;
+  user-select: none;
+}
 .chart-wrap { flex: 1; min-height: 0; padding: 8px; }
 .chart { width: 100%; height: 100%; }
 
