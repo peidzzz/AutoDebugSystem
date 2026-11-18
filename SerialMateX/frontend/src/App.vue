@@ -86,7 +86,8 @@ const baudRate = ref(115200);
 const dataBits = ref(8);
 const stopBits = ref(1);
 const parity = ref('None');
-const baudOptions = [9600, 19200, 38400, 57600, 115200, 921600];
+// 典型波特率：下拉只给常用值，避免手输笔误连不上（12 项与设备参数弹窗保持一致）
+const baudOptions = [4800, 9600, 14400, 19200, 38400, 57600, 115200, 128000, 230400, 256000, 460800, 921600];
 
 // Network 参数
 const netIp = ref('127.0.0.1');
@@ -138,7 +139,8 @@ const deviceMenu = ref('');
 const toggleDeviceMenu = (key: string) => {
   deviceMenu.value = deviceMenu.value === key ? '' : key;
 };
-const deviceBaudOptions = [4800, 9600, 14400, 19200, 38400, 57600, 115200, 128000, 230400, 256000, 460800, 921600];
+// 设备参数弹窗与 SERIAL 栏共用同一份典型波特率，避免两处列表走样
+const deviceBaudOptions = baudOptions;
 const deviceStopBitsOptions = [
   { label: '1', value: 1 },
   { label: '1.5', value: 15 },
@@ -796,9 +798,18 @@ const selectEol = (val: 'NONE' | 'LF' | 'CRLF') => {
 
 // 自定义下拉框状态管理
 const showPortDropdown = ref(false);
+const showBaudDropdown = ref(false);
 const showDataBitsDropdown = ref(false);
 const showParityDropdown = ref(false);
 const showStopBitsDropdown = ref(false);
+
+// 波特率下拉项：常用值之外，如果当前值不属于列表（旧配置或设备参数里自填的），补一项进去，
+// 否则换回下拉后当前速率会"凭空消失"，用户也无从选回原值。
+const baudMenuOptions = computed(() => {
+  const list = [...baudOptions];
+  if (!list.includes(baudRate.value)) list.push(baudRate.value);
+  return list.sort((a, b) => a - b);
+});
 // TASK 页的“设备选择”下拉
 const showDeviceDropdown = ref(false);
 
@@ -2008,14 +2019,23 @@ const scrollToBottom = () => scrollLogToEnd();
                 </div>
               </div>
 
-              <!-- 波特率 Baud Rate -->
+              <!-- 波特率 Baud Rate：典型值下拉，与数据位/停止位同款控件 -->
               <div class="field-row">
                 <label class="field-label">波特率</label>
                 <div class="field-wrap">
-                  <input type="number" v-model="baudRate" list="baud-list" class="field mono" placeholder="Custom" :disabled="isConnected">
-                  <datalist id="baud-list">
-                    <option v-for="b in baudOptions" :key="b" :value="b"></option>
-                  </datalist>
+                  <button @click="!isConnected && (showBaudDropdown = !showBaudDropdown)" class="field field--btn" :class="{ 'is-disabled': isConnected }">
+                    <span class="mono">{{ baudRate }}</span>
+                    <svg class="chev" :class="{ 'is-open': showBaudDropdown }" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                  </button>
+                  <div v-if="showBaudDropdown && !isConnected" @click="showBaudDropdown = false" class="fixed inset-0 z-0 cursor-default"></div>
+                  <Transition name="slide-fade">
+                    <div v-if="showBaudDropdown && !isConnected" class="menu">
+                      <button v-for="b in baudMenuOptions" :key="b" @click="baudRate = b; showBaudDropdown = false" class="menu-item" :class="{ 'is-on': baudRate === b }">
+                        <span class="mono">{{ b }}</span>
+                        <span v-if="baudRate === b" class="menu-tick">✓</span>
+                      </button>
+                    </div>
+                  </Transition>
                 </div>
               </div>
 
@@ -2252,7 +2272,7 @@ const scrollToBottom = () => scrollLogToEnd();
           <div class="bar-group">
             <div class="seg seg--xs">
               <button @click="showChart = false" :class="{ 'is-on': !showChart }">Text</button>
-              <button @click="showChart = true" :class="{ 'is-on': showChart }">Plot</button>
+              <button disabled title="暂未开放" :class="{ 'is-on': showChart }">Plot</button>
             </div>
             <button @click="clearReceive" title="清空" class="icon-btn clear-btn">
               <svg class="broom-icon" :class="{ 'broom-clicked': isBroomClicked }" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m7 21-4-4 10-10a2.83 2.83 0 0 1 4 4L7 21Z"></path><path d="m11 9 4 4"></path><path d="M3 21h18"></path></svg>
@@ -3011,6 +3031,9 @@ const scrollToBottom = () => scrollLogToEnd();
   color: var(--text-main);
   box-shadow: var(--shadow-xs);
 }
+/* 未开放的页签（Plot）置灰但保留位置，避免选项突然消失让人以为界面坏了 */
+.seg > button:disabled { opacity: 0.45; cursor: not-allowed; }
+.seg > button:disabled:hover { color: var(--text-sub); }
 .seg--sub { margin-bottom: 2px; }
 .seg--sub > button { letter-spacing: 0.06em; }
 .seg--xs { flex: none; height: 24px; padding: 2px; gap: 1px; border-radius: 6px; }
