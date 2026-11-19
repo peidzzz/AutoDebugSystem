@@ -30,7 +30,9 @@ func main() {
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
-		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
+		// 窗口底色 = 默认皮肤 Bench 的 --bg-main（#F7F5EF）。这个颜色只在
+		// WebView2 还没画出第一帧时露一下；用深色会让浅色皮肤启动时闪一下黑底。
+		BackgroundColour: &options.RGBA{R: 247, G: 245, B: 239, A: 1},
 		OnStartup:        app.startup,
 		Bind: []interface{}{
 			app,
