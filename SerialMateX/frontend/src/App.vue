@@ -847,8 +847,10 @@ const MAX_LOG_LINES = 2000;
 const transcript = ref<LogLine[]>([]);
 // 单调递增的行号：到 2000 行上限开始裁剪时 :key 不会整体错位（否则整表每行都要重新 patch）
 let logSeq = 0;
-// 还没收到 \n 的尾巴：先按原样显示成一行，下一个 chunk 继续往后追加，避免半行被拆成两条
-let rxPendingLine = '';
+// 还没收到 \n 的这一行用「字符数组 + 光标」表示：终端里退格（\b / 0x7F）要真的删字符、
+// 回车（\r）要把光标拉回行首覆盖本行，纯字符串表达不了这两种改写
+let rxLineChars: string[] = [];
+let rxLineCursor = 0;
 // 这条未换行的 RX 行显示在 transcript 的哪一行上（-1 = 当前没有未换行的行）
 let rxOpenIdx = -1;
 // 单行最长字符数：下位机长时间不换行时只保留尾部，避免一条行无限增长拖垮渲染
@@ -856,7 +858,19 @@ const MAX_LOG_LINE_CHARS = 4096;
 // 行视图用自己的解码器：receivedData 那支是流式状态（{stream:true}），两边共用一个会互相推进多字节状态
 const lineDecoder = new TextDecoder('utf-8');
 // 接收区空态提示：行视图是 div，用不了 ::placeholder，Hex 的 textarea 复用同一句话
-const RX_HINT = '点击这里后直接键入即可发送（Enter 发单个回车、↑/↓ 翻历史、Backspace 发 0x7F、Ctrl+C 中断；选中文本可 Ctrl+C 复制、Ctrl+V 直接发给下位机）';
+const RX_HINT = '点击这里后直接键入即可发送（Enter 发回车、↑/↓ 翻历史、Backspace 发 0x7F、Esc/Delete/←/→/Home/End/PgUp/PgDn 发转义序列、Ctrl+字母 发 0x01–0x1A；选中文本可 Ctrl+C 复制、Ctrl+V 直接发给下位机）';
+
+// 功能键按 xterm 的转义序列原样发出：下位机的 shell（letter-shell 等）认这一套
+const ESC_KEYS: Record<string, string> = {
+  Escape: '\x1b',
+  Delete: '\x1b[3~',
+  ArrowLeft: '\x1b[D',
+  ArrowRight: '\x1b[C',
+  Home: '\x1b[H',
+  End: '\x1b[F',
+  PageUp: '\x1b[5~',
+  PageDown: '\x1b[6~',
+};
 
 const nowHms = (): string => new Date().toTimeString().slice(0, 8);
 
@@ -874,35 +888,71 @@ const appendLogLine = (dir: 'rx' | 'tx', text: string, time = '') => {
   }
 };
 
+const rxLineText = (): string => rxLineChars.join('');
+
+// 未换行的行先挂到 transcript 上（下位机提示符常常不带换行），后续 chunk 就地改写这一行
+const syncRxPendingLine = () => {
+  // 一直不换行时只保留尾部，避免这一行无限增长拖垮渲染；光标跟着前移
+  if (rxLineChars.length > MAX_LOG_LINE_CHARS) {
+    const dropped = rxLineChars.length - MAX_LOG_LINE_CHARS;
+    rxLineChars.splice(0, dropped);
+    rxLineCursor = Math.max(0, rxLineCursor - dropped);
+  }
+  const text = clampLineText(rxLineText());
+  if (rxOpenIdx >= 0) {
+    // 退格删空时也要同步成空行，否则屏幕上留着已经删掉的字符
+    transcript.value[rxOpenIdx].text = text;
+  } else if (text) {
+    appendLogLine('rx', text);
+    rxOpenIdx = transcript.value.length - 1;
+  }
+};
+
+// 收到 \n：把当前行收尾。已经显示过的按行号改写，从没显示过的补一行（空行也要保留）
+const finishRxLine = () => {
+  const text = clampLineText(rxLineText());
+  if (rxOpenIdx >= 0) {
+    transcript.value[rxOpenIdx].text = text;
+  } else {
+    appendLogLine('rx', text);
+  }
+  rxOpenIdx = -1;
+  rxLineChars = [];
+  rxLineCursor = 0;
+};
+
+// 行视图必须按终端语义解释字节流：下位机回显退格时发的是 \b 或 0x7F，若原样塞进文本，
+// 光标回不到上一格，表现就是"按下退格没反应"。规则：
+//   \n 收尾换行；\r 光标回行首（后续字符覆盖本行，进度条刷新靠这个）；
+//   \b / 0x7F 删掉光标前一个字符；其余控制字符（含 ESC 序列）不参与显示。
 const pushRxChunk = (chunk: string) => {
   if (!chunk) return;
-  const segments = (rxPendingLine + chunk).split('\n');
-  rxPendingLine = segments.pop() ?? '';
-  // 每行去掉 CRLF 里的 \r，行视图不需要这个控制字符
-  const lines = segments.map((s) => s.replace(/\r$/, ''));
-
-  // 上一块没换行的内容已经显示出来了：它的收尾就是这一行，用拼接后的完整内容替换它，
-  // 而不是再起一行（TX 行插在中间时下标不在末尾，同样按行号替换，不会重复显示）
-  if (rxOpenIdx >= 0 && lines.length > 0) {
-    transcript.value[rxOpenIdx].text = clampLineText(lines.shift()!);
-    rxOpenIdx = -1;
-  }
-  for (const line of lines) appendLogLine('rx', line);
-
-  // 极端情况：一直不换行时只保留尾部（可见行同步成同一份文本，不会重复）
-  rxPendingLine = clampLineText(rxPendingLine);
-
-  if (rxPendingLine) {
-    // 尾巴先显示出来（下位机提示符常常不带换行），下一次 chunk 接着往后追加
-    if (rxOpenIdx >= 0) {
-      transcript.value[rxOpenIdx].text = rxPendingLine;
-    } else {
-      appendLogLine('rx', rxPendingLine);
-      rxOpenIdx = transcript.value.length - 1;
+  for (const ch of chunk) {
+    if (ch === '\n') {
+      finishRxLine();
+      continue;
     }
-  } else {
-    rxOpenIdx = -1;
+    if (ch === '\r') {
+      rxLineCursor = 0;
+      continue;
+    }
+    if (ch === '\b' || ch === '\u007f') {
+      if (rxLineCursor > 0) {
+        rxLineCursor -= 1;
+        rxLineChars.splice(rxLineCursor, 1);
+      }
+      continue;
+    }
+    const code = ch.codePointAt(0) ?? 0;
+    if (code < 0x20 || code === 0x7f) continue;
+    if (rxLineCursor < rxLineChars.length) {
+      rxLineChars[rxLineCursor] = ch;
+    } else {
+      rxLineChars.push(ch);
+    }
+    rxLineCursor += 1;
   }
+  syncRxPendingLine();
   // 滚屏交给调用方：一批数据处理完只滚一次，这里不重复排 nextTick
 };
 
@@ -1694,6 +1744,16 @@ const onRxKeydown = async (e: KeyboardEvent) => {
     await sendRaw('\x03');
     return;
   }
+  // Ctrl+字母：终端里对应的就是 0x01–0x1A（Ctrl+D 断开、Ctrl+Z 挂起、Ctrl+L 清屏…）。
+  // A / C / V / X 留给浏览器（全选、复制、粘贴、剪切），接收区里这些操作比发控制码更有用。
+  if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && e.key.length === 1) {
+    const ch = e.key.toLowerCase();
+    if (ch >= 'a' && ch <= 'z' && ch !== 'a' && ch !== 'c' && ch !== 'v' && ch !== 'x') {
+      e.preventDefault();
+      await sendRaw(String.fromCharCode(ch.charCodeAt(0) - 96));
+      return;
+    }
+  }
   // 其余组合键留给浏览器（复制、全选等）
   if (e.ctrlKey || e.metaKey || e.altKey) return;
 
@@ -1726,6 +1786,14 @@ const onRxKeydown = async (e: KeyboardEvent) => {
     e.preventDefault();
     rxLineBuffer.value = rxLineBuffer.value.slice(0, -1);
     await sendRaw('\x7f');
+    return;
+  }
+  // 剩下这些没有本地语义，按 VT100/xterm 的转义序列原样发给下位机
+  const escKey = ESC_KEYS[e.key];
+  if (escKey) {
+    e.preventDefault();
+    if (e.key === 'Escape') rxLineBuffer.value = '';
+    await sendRaw(escKey);
     return;
   }
   if (e.key === 'Tab') {
@@ -1811,7 +1879,8 @@ const clearReceive = () => {
   rxCount.value = 0;
   // 行视图也要一起清，否则清空后旧行还挂在屏幕上
   transcript.value = [];
-  rxPendingLine = '';
+  rxLineChars = [];
+  rxLineCursor = 0;
   rxOpenIdx = -1;
   // 清除之前的定时器（如果存在）
   if (broomAnimationTimer) {
@@ -3382,7 +3451,7 @@ const scrollToBottom = () => scrollLogToEnd();
 .btn-device {
   height: 30px;
   margin-bottom: 6px;
-  justify-content: flex-start;
+  justify-content: center;
   gap: 7px;
   font-size: 11.5px;
   font-weight: 500;
@@ -3544,6 +3613,14 @@ const scrollToBottom = () => scrollLogToEnd();
   /* 根节点是 select-none（避免拖窗口时选中整页），接收区要能选文字才能 Ctrl+C 复制 */
   -webkit-user-select: text;
   user-select: text;
+}
+/* 三栏面板本身有 1px 描边，接收区再套 2px 焦点环只会漏出顶边一条线（左右下都被面板裁掉）；
+   focus-visible 又因为 role=textbox 在键入时必然命中，所以这里显式关掉，避免"标题框下面出现一根线" */
+.rx-log:focus,
+.rx-log:focus-visible,
+.rx-text:focus,
+.rx-text:focus-visible {
+  outline: none;
 }
 .rx-line {
   min-height: 1.72em; /* 空行也要占一行高度，否则接收里的空行会被吃掉 */
