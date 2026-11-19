@@ -738,9 +738,9 @@ func (a *App) runCommands(cmds []AutoCmd, deadline time.Time) bool {
 				return false
 			}
 			// 发送成功才记录：日志里留一行 [TX 时:分:秒] 正文，同时推给界面高亮显示。
-			// 日志行与事件用同一个字符串（编码后真正发出去的文本，去掉行尾的 \r/\n：
-			// 命令的 Enter 是发给设备的，不该破坏按行阅读的日志），时间也只取一次。
-			logText := strings.TrimRight(text, "\r\n")
+			// 日志行与事件用同一个字符串：显示的是命令原文里的功能键标记（{UP} / {ENTER}），
+			// 而不是发出去的 ESC 序列 —— 后者在日志里就是乱码。时间也只取一次。
+			logText := formatCmdLogText(cmd.Text, cmd.Hex)
 			at := time.Now().Format("15:04:05")
 			t.mu.Lock()
 			logPath := t.logPath

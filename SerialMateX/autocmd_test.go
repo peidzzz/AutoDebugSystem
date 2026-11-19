@@ -318,6 +318,29 @@ func TestBuildTxPayload(t *testing.T) {
 	}
 }
 
+// formatCmdLogText 是日志与界面里显示 TX 命令用的形态：功能键标记原样保留，
+// 裸控制字符写成 {0xNN}，HEX 命令按字节列表显示。
+func TestFormatCmdLogText(t *testing.T) {
+	cases := []struct {
+		text  string
+		asHex bool
+		want  string
+	}{
+		{"AT+RST{UP}{ENTER}", false, "AT+RST{UP}{ENTER}"},
+		{"AT+RST   ", false, "AT+RST"},
+		{"a\rb\x1b", false, "a{0x0D}b{0x1B}"},
+		{"A{FOO}B", false, "A{FOO}B"},
+		{"A{", false, "A{"},
+		{"0x01 0xaa", true, "0x01 0xaa"},
+		{"0x01   0xaa  ", true, "0x01 0xaa"},
+	}
+	for _, c := range cases {
+		if got := formatCmdLogText(c.text, c.asHex); got != c.want {
+			t.Fatalf("formatCmdLogText(%q, %v) = %q, 期望 %q", c.text, c.asHex, got, c.want)
+		}
+	}
+}
+
 func TestExportImportAutoCmds(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("SERIALMATEX_AUTOCMD_DIR", dir)

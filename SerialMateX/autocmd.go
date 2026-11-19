@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -345,6 +346,39 @@ func encodeCmdPayload(text string, asHex, withEnter bool) ([]byte, error) {
 func buildTxPayload(text string) string {
 	payload, _ := encodeCmdPayload(text, false, true)
 	return string(payload)
+}
+
+// formatCmdLogText 返回一条 TX 命令写进日志、推给界面时用的可读形态：
+//   - HEX 命令按用户输入的字节列表显示（只把连续空白收成一个空格）；
+//   - 文本命令保留 {ENTER} / {UP} 之类功能键标记 —— 真正发出去的是 ESC 序列，
+//     直接写进日志就是乱码，这里仍显示标记，和设备收到的效果一一对应；
+//   - 意外混进来的裸控制字符写成 {0xNN}，日志里不再出现不可见字符；
+//   - 末尾的空格 / 制表符去掉（和发送前裁剪一致）。
+func formatCmdLogText(text string, asHex bool) string {
+	if asHex {
+		return strings.Join(strings.Fields(text), " ")
+	}
+
+	var b strings.Builder
+	b.Grow(len(text))
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case c == '{':
+			end := strings.IndexByte(text[i:], '}')
+			if end < 0 {
+				b.WriteString(text[i:])
+				return strings.TrimRight(b.String(), " \t")
+			}
+			b.WriteString(text[i : i+end+1])
+			i += end
+		case c < 0x20 || c == 0x7f:
+			fmt.Fprintf(&b, "{0x%02X}", c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return strings.TrimRight(b.String(), " \t")
 }
 
 // formatAutoCmds 生成 auto_cmd.txt 的内容（保存与导出共用）。

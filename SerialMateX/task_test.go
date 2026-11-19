@@ -914,6 +914,51 @@ func TestTaskTxLogLineStripsEOL(t *testing.T) {
 	}
 }
 
+// TestTaskTxLogUsesKeyTokens 日志里的功能键要写成 {UP} 这样的标记：
+// 真正发出去的是 ESC 序列，但把它原样写进日志就是乱码。
+func TestTaskTxLogUsesKeyTokens(t *testing.T) {
+	writeTaskFixtures(t,
+		"[Task]\nSaveLog=1\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+		"TX AT+RST{UP} 00 enter=0\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	var sent string
+	taskSendHook = func(s string) string { sent = s; return "Sent" }
+	defer func() { taskSendHook = nil }()
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if rt.NormalCount != 1 {
+		t.Fatalf("一轮应算正常: normal=%d msg=%s", rt.NormalCount, rt.Message)
+	}
+
+	// 线上发的仍是转义序列，只有日志换成标记
+	if sent != "AT+RST\x1b[A" {
+		t.Fatalf("发给设备的字节应为转义序列: %q", sent)
+	}
+
+	text := readTaskLog(t)
+	if strings.ContainsAny(text, "\x1b") {
+		t.Fatalf("日志里不该出现 ESC 字节: %q", text)
+	}
+	idx := strings.Index(text, "[TX ")
+	if idx < 0 {
+		t.Fatalf("日志里没有 TX 行: %q", text)
+	}
+	nl := strings.IndexByte(text[idx:], '\n')
+	if nl < 0 {
+		t.Fatalf("TX 行后面没有换行: %q", text)
+	}
+	line := text[idx : idx+nl]
+	if !regexp.MustCompile(`^\[TX \d{2}:\d{2}:\d{2}\] AT\+RST\{UP\}$`).MatchString(line) {
+		t.Fatalf("TX 行应显示功能键标记: %q", line)
+	}
+}
+
 // TestTaskTxNoLineWhenSendFails 发送失败不留 TX 行：日志只记录真正发出去的字节。
 func TestTaskTxNoLineWhenSendFails(t *testing.T) {
 	writeTaskFixtures(t,
