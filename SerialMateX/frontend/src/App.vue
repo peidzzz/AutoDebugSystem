@@ -704,6 +704,9 @@ const toggleAutoRun = async () => {
     showModal('无法启动任务', res, 'error');
     return;
   }
+  // 启动即清掉列表选中：选中态只用于「新增插入位置 / 删除目标」，
+  // 任务跑起来以后还挂着一行高亮，既没有用处，也容易让人以为那行正在被单独执行。
+  autoCmdSelected.value = -1;
   await pollTaskRuntime();
   startTaskPolling();
 };
@@ -1543,7 +1546,8 @@ onMounted(async () => {
   // 接收区获焦时的粘贴兜底（见 onDocumentPaste）
   document.addEventListener('paste', onDocumentPaste);
 
-  // 任务发出的 TX 命令：另起一行显示（后端已去掉行尾 CR/LF，time 是发送时刻 HH:MM:SS）
+  // 任务发出的 TX 命令：另起一行显示（后端给的是可读形态——功能键保留 {UP} / {ENTER} 标记、
+  // 不带行尾 CR/LF，time 是发送时刻 HH:MM:SS）
   EventsOn("task-tx", (data: any) => {
     if (!data) return;
     // 先把还压在队列里的 RX 处理掉再写这一行：rAF 循环 30ms 才跑一次，
