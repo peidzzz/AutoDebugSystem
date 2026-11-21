@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -30,7 +31,7 @@ type TaskRunOptions struct {
 type TaskRuntime struct {
 	Running      bool   `json:"running"`      // 是否正在跑
 	Paused       bool   `json:"paused"`       // 是否因异常暂停
-	PausedReason string `json:"pausedReason"` // 暂停原因："abnormal" 表示有命令没跑完；空串表示没暂停
+	PausedReason string `json:"pausedReason"` // 暂停原因："abnormal" 命令没跑完 / "ping" PING 未通过；空串表示没暂停
 	Round        int    `json:"round"`        // 当前轮次（从 1 开始，未运行 0）
 	RunCount     int    `json:"runCount"`     // 总轮次
 	NormalCount  int    `json:"normalCount"`  // 正常完成轮次
@@ -44,6 +45,7 @@ type TaskRuntime struct {
 	CmdCountdown int    `json:"cmdCountdown"` // 当前命令数字的倒计时剩余秒
 	LogPath      string `json:"logPath"`      // 本次日志文件路径（未开日志为空）
 	CsvPath      string `json:"csvPath"`      // 本次功耗文件路径（未开功耗为空）
+	PingState    string `json:"pingState"`    // PING 状态："" 未检测 / running 检测中 / ok 通过 / fail 未通过
 	Message      string `json:"message"`      // 结束原因等提示
 }
 
@@ -78,6 +80,7 @@ func (a *App) StartTask(opts TaskRunOptions) string {
 		return "请先在 SERIAL 页连接 COM 口"
 	}
 
+	cfg := a.GetTaskConfig()
 	cmds := a.GetAutoCmds()
 	// 丢掉空命令：否则会多发一个空回车，看起来像“多跑了一条命令”
 	filtered := make([]AutoCmd, 0, len(cmds))
@@ -87,11 +90,17 @@ func (a *App) StartTask(opts TaskRunOptions) string {
 		}
 	}
 	cmds = filtered
-	if len(cmds) == 0 {
+	// PING 开启时允许空命令列表：那就是「只做连通性检查」的任务，
+	// 正常次数就等于 PING 通过的轮数。
+	if len(cmds) == 0 && !cfg.PingEnable {
 		return "AUTO CMD 里还没有命令"
 	}
 
-	cfg := a.GetTaskConfig()
+	// PING 地址在启动时先校验一次，免得跑到一半才发现打不到目标。
+	if cfg.PingEnable && !validIPv4(cfg.PingIP) {
+		return "PING 目标地址无效：" + cfg.PingIP
+	}
+
 	device, ok := a.findPwrDevice(opts.DeviceName)
 	if !ok {
 		return "没有找到电源设备：" + opts.DeviceName
@@ -567,6 +576,7 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			rt.CmdCountdown = 0
 			rt.Phase = "running"
 			rt.Message = ""
+			rt.PingState = ""
 			rt.Countdown = cfg.WaitSeconds
 			rt.CountdownTo = "powerOff"
 		})
@@ -611,17 +621,50 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			break
 		}
 
+		// PING 检测：命令跑完并且运行时间到时才做（掉电之前，设备还在上电状态）。
+		// 是否执行只看 PingEnable —— 没开日志、没开异常暂停时也必须检测，
+		// 否则这几轮的「正常次数」就等于 PING 通过次数，跳过检测会让计数失真。
+		pingFailed := false
+		pingRecv := 0
+		if cfg.PingEnable && complete && !t.stopped() {
+			var pingErr error
+			pingRecv, pingErr = a.runPingCheck(cfg.PingIP)
+			passed := pingErr == nil && pingPassed(pingRecv)
+			if !t.stopped() {
+				if logPath != "" {
+					t.appendMarkedLog(logPath, pingLogLine(time.Now().Format("15:04:05"), cfg.PingIP, pingRecv, passed))
+				}
+				t.set(func(rt *TaskRuntime) {
+					if passed {
+						rt.PingState = "ok"
+					} else {
+						rt.PingState = "fail"
+					}
+				})
+				pingFailed = !passed
+			}
+		}
+
 		// 异常暂停：等界面给出决定。停止（stopCh）也按“结束任务”处理，
 		// 所以无论用户点结束、跳过还是停止，这个 goroutine 都不会被永久挂住。
 		endRequested := false
 		skipRound := false
-		if !complete && cfg.AbnormalPause {
-			t.set(func(rt *TaskRuntime) {
-				rt.Paused = true
-				rt.Phase = "paused"
-				rt.PausedReason = "abnormal"
-				rt.Message = "有命令未执行完，已暂停（电源保持）"
-			})
+		if (!complete || pingFailed) && cfg.AbnormalPause && !t.stopped() {
+			if !complete {
+				t.set(func(rt *TaskRuntime) {
+					rt.Paused = true
+					rt.Phase = "paused"
+					rt.PausedReason = "abnormal"
+					rt.Message = "有命令未执行完，已暂停（电源保持）"
+				})
+			} else {
+				t.set(func(rt *TaskRuntime) {
+					rt.Paused = true
+					rt.Phase = "paused"
+					rt.PausedReason = "ping"
+					rt.Message = fmt.Sprintf("PING %s 未通过（回包 %d/%d），已暂停（电源保持）", cfg.PingIP, pingRecv, pingPacketCount)
+				})
+			}
 			var action string
 			select {
 			case action = <-t.decision:
@@ -655,7 +698,7 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			stopCsv()
 			stopCsv = nil
 		}
-		if complete && offErr == nil {
+		if complete && !pingFailed && offErr == nil {
 			t.set(func(rt *TaskRuntime) { rt.NormalCount++ })
 		}
 		if offErr != nil {
@@ -796,6 +839,38 @@ func (a *App) runCommands(cmds []AutoCmd, deadline time.Time) (bool, string) {
 
 	t.set(func(rt *TaskRuntime) { rt.CmdIndex = -1; rt.CmdPhase = ""; rt.CmdCountdown = 0 })
 	return true, ""
+}
+
+// runPingCheck 在「命令跑完、运行时间到」之后探测一次目标地址，返回成功回包数。
+// 期间 TASK STATUS 显示 Phase="ping"；用户点停止会取消 ctx，让 ping.exe 立刻退出。
+func (a *App) runPingCheck(ip string) (int, error) {
+	t := &a.task
+	t.set(func(rt *TaskRuntime) {
+		rt.Phase = "ping"
+		rt.PingState = "running"
+		rt.Message = "正在 PING " + ip + "…"
+		rt.Countdown = 0
+		rt.CountdownTo = ""
+		rt.CmdIndex = -1
+		rt.CmdPhase = ""
+		rt.CmdCountdown = 0
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), pingTimeout)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-t.stopCh:
+			cancel()
+		case <-done:
+		}
+	}()
+
+	recv, err := pingProbe(ctx, ip)
+	close(done)
+	t.set(func(rt *TaskRuntime) { rt.Message = "" })
+	return recv, err
 }
 
 // taskLogBanner 生成带 * 框的起始 / 停止标识，便于在日志里一眼定位。
