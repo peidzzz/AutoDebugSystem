@@ -409,23 +409,32 @@ func (t *taskEngine) appendTaskLog(logPath, text string) {
 	appendFile(logPath, text)
 }
 
-// appendTxLog 把任务发出的一条 TX 命令记进日志：[TX 15:04:05] 正文。
-// 前后各用恰好一个换行夹住：日志里的 RX 数据可能不带换行（甚至什么都还没写），
-// 不加前置换行就会把 TX 行粘在上一段 RX 字节后面。
-// at 由调用方统一取一次时间，保证日志行和 task-tx 事件的时间一致。
-func (t *taskEngine) appendTxLog(logPath, at, text string) {
+// appendMarkedLog 写一行带标记的日志（line 含末尾换行）：日志里的 RX 数据可能不带换行
+// （甚至什么都还没写），不加前置换行就会把这一行粘在上一段 RX 字节后面。
+// “看最后一个字节 + 追加”必须在同一把锁里完成，否则 RX 数据可能插在中间，
+// 前置换行就白算了（会得到 ...\nOK[TX ...] 这种粘在一起的日志）。
+func (t *taskEngine) appendMarkedLog(logPath, line string) {
 	if logPath == "" {
 		return
 	}
-	// “看最后一个字节 + 追加”必须在同一把锁里完成，否则 RX 数据可能插在中间，
-	// 前置换行就白算了（会得到 ...\nOK[TX ...] 这种粘在一起的日志）。
 	t.logMu.Lock()
 	defer t.logMu.Unlock()
 	prefix := ""
 	if last, ok := lastFileByte(logPath); ok && last != '\n' {
 		prefix = "\n"
 	}
-	appendFile(logPath, prefix+"[TX "+at+"] "+text+"\n")
+	appendFile(logPath, prefix+line)
+}
+
+// appendTxLog 把任务发出的一条 TX 命令记进日志：[TX 15:04:05] 正文。
+// at 由调用方统一取一次时间，保证日志行和 task-tx 事件的时间一致。
+func (t *taskEngine) appendTxLog(logPath, at, text string) {
+	t.appendMarkedLog(logPath, "[TX "+at+"] "+text+"\n")
+}
+
+// cmdLogLine 是「这一轮命令没跑完」的日志行，写清第几轮、失败在哪一步。
+func cmdLogLine(at string, round int, reason string) string {
+	return "[CMD " + at + "] 第 " + strconv.Itoa(round) + " 次测试未完成：" + reason + "\n"
 }
 
 // lastFileByte 读文件的最后一个字节，用来判断日志是否已经以换行结尾。
@@ -586,8 +595,14 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 		deadline := time.Now().Add(time.Duration(cfg.WaitSeconds) * time.Second)
 		// 命令执行期间也要实时显示“N 秒后掉电”，所以起一个独立的倒计时刷新
 		stopTick := t.startDeadlineTicker(deadline)
-		complete := a.runCommands(cmds, deadline)
+		complete, failReason := a.runCommands(cmds, deadline)
 		stopTick()
+
+		// 命令没跑完时先留一行 [CMD]，写清第几轮、卡在第几条命令；
+		// 否则「正常次数比总轮次少 1」在没开异常暂停时完全没有痕迹。
+		if !complete && logPath != "" {
+			t.appendMarkedLog(logPath, cmdLogLine(time.Now().Format("15:04:05"), round, failReason))
+		}
 
 		if !t.countdown(deadline, "running", "powerOff") {
 			t.set(func(rt *TaskRuntime) { rt.PowerOn = false })
@@ -703,12 +718,16 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 	})
 }
 
-// runCommands 在 deadline 之前依次执行命令；返回 true 表示全部执行完。
-func (a *App) runCommands(cmds []AutoCmd, deadline time.Time) bool {
+// runCommands 在 deadline 之前依次执行命令；complete 为 false 时 reason 说明卡在哪一步
+// （写给日志的 [CMD] 行，用户靠它知道是第几条命令出的问题）。
+func (a *App) runCommands(cmds []AutoCmd, deadline time.Time) (bool, string) {
 	t := &a.task
 	for i, cmd := range cmds {
-		if t.stopped() || !time.Now().Before(deadline) {
-			return false
+		if t.stopped() {
+			return false, fmt.Sprintf("命令 %d 未执行：任务已停止", i+1)
+		}
+		if !time.Now().Before(deadline) {
+			return false, fmt.Sprintf("运行时间内没轮到命令 %d（%s %q）", i+1, cmd.Type, cmd.Text)
 		}
 
 		t.set(func(rt *TaskRuntime) {
@@ -722,7 +741,10 @@ func (a *App) runCommands(cmds []AutoCmd, deadline time.Time) bool {
 			// 只认“开始等待之后”收到的数据：先清空缓冲，避免上一轮/上一条的旧数据立刻命中
 			t.clearRx()
 			if !t.waitForMatch(cmd.Text, deadline) {
-				return false
+				if t.stopped() {
+					return false, fmt.Sprintf("命令 %d 未执行完：任务已停止", i+1)
+				}
+				return false, fmt.Sprintf("命令 %d（%s %q）在运行时间内没收到匹配数据", i+1, cmd.Type, cmd.Text)
 			}
 		} else {
 			// TX：统一走 encodeCmdPayload —— HEX 按字节解析，文本展开 {ENTER} / {UP} 之类功能键标记，
@@ -730,12 +752,12 @@ func (a *App) runCommands(cmds []AutoCmd, deadline time.Time) bool {
 			payload, encErr := encodeCmdPayload(cmd.Text, cmd.Hex, cmd.Enter)
 			if encErr != nil {
 				t.set(func(rt *TaskRuntime) { rt.Message = fmt.Sprintf("第 %d 条命令编码失败：%v", i+1, encErr) })
-				return false
+				return false, fmt.Sprintf("命令 %d（%s %q）编码失败：%v", i+1, cmd.Type, cmd.Text, encErr)
 			}
 			text := string(payload)
 			if res := a.taskSend(text); strings.HasPrefix(res, "Error") || strings.HasPrefix(res, "Send") {
 				t.set(func(rt *TaskRuntime) { rt.Message = "发送失败：" + res })
-				return false
+				return false, fmt.Sprintf("命令 %d（%s %q）发送失败：%s", i+1, cmd.Type, cmd.Text, res)
 			}
 			// 发送成功才记录：日志里留一行 [TX 时:分:秒] 正文，同时推给界面高亮显示。
 			// 日志行与事件用同一个字符串：显示的是命令原文里的功能键标记（{UP} / {ENTER}），
@@ -763,17 +785,17 @@ func (a *App) runCommands(cmds []AutoCmd, deadline time.Time) bool {
 					break
 				}
 				if !t.sleep(100 * time.Millisecond) {
-					return false
+					return false, fmt.Sprintf("命令 %d 未执行完：任务已停止", i+1)
 				}
 			}
 			if !time.Now().Before(deadline) {
-				return false
+				return false, fmt.Sprintf("运行时间在命令 %d 之后用完，剩余命令未执行", i+1)
 			}
 		}
 	}
 
 	t.set(func(rt *TaskRuntime) { rt.CmdIndex = -1; rt.CmdPhase = ""; rt.CmdCountdown = 0 })
-	return true
+	return true, ""
 }
 
 // taskLogBanner 生成带 * 框的起始 / 停止标识，便于在日志里一眼定位。
