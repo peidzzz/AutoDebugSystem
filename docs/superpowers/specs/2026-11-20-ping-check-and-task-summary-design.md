@@ -199,16 +199,16 @@ func pingPassed(recv int) bool
 
 `TaskRuntime` 新增（json 小驼峰）：`pingState string`（`""`/`"running"`/`"ok"`/`"fail"`）；`PausedReason` 已有，新增取值 `"ping"`。
 
-TASK SETTINGS「运行次数」下面新增一行：
+右栏「AUTO CMD」命令列表下方、启动按钮上方新增一行（2026-11-21 按用户要求从 TASK SETTINGS 移过来，标题由「PING 检测」改为「PING」）：
 
 ```
 ┌─────────────────────────────────────┐
-│ PING        [192.168.1.10]  (开)    │   ← 输入框 100px 等宽居中，开关在右
+│ PING   [192.168.1.10]        (开)   │   ← 与命令列表同宽，开关在右
 └─────────────────────────────────────┘
 ```
 
-- 结构：`.setting-row` > `.setting-label`「PING」+ `.ping-ctl`（`display:flex; gap:6px`）> `input.field.field--ip` + `button.switch`。
-- `.field--ip`：等宽 11px、居中、宽 ~100px；`:disabled` 时保持可读灰。
+- 结构：`.rail--r` > `.ping-bar`（`display:flex; gap:7px; padding:7px 12px; border-top:1px solid var(--line)`）> `.ping-label`「PING」+ `input.field.field--ip` + `button.switch`。
+- `.field--ip`：等宽 11px、左对齐、占满剩余宽度；`:disabled` 时保持可读灰。
 - 高亮（PING 进行中）：`.field--ip.is-ping { border-color: var(--col-primary); box-shadow: 0 0 0 3px var(--accent-ring) }`。
 - 红底（`pingState === 'fail' && taskConfig.abnormalPause && taskRt.running`）：`.field--ip.is-ping-fail { background: color-mix(in srgb, var(--col-error) 16%, var(--field)); border-color: var(--col-error); color: var(--col-error) }`。
 - 失败瞬间的短提示（**无论是否开异常暂停、是否开保存日志**）：`pingState` 由 `running` 变 `fail` 时给 IP 栏加 `.is-ping-flash`（`border-color: var(--col-error)` + `box-shadow: 0 0 0 3px color-mix(in srgb, var(--col-error) 30%, transparent)`），2 秒后自动移除；不常驻、不改底色，所以不会和上面的红底打架。

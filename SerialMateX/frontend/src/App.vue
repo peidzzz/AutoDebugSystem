@@ -2419,32 +2419,6 @@ const scrollToBottom = () => scrollLogToEnd();
                     <span class="tabular-nums">{{ taskConfig.runCount }}</span><span class="chip-unit">次</span>
                   </button>
                 </div>
-                <div class="setting-row setting-row--ping">
-                  <span class="setting-label">PING 检测</span>
-                  <div class="ping-ctl">
-                    <input
-                      v-model="taskConfig.pingIP"
-                      @change="commitPingIP"
-                      :disabled="taskRt.running"
-                      class="field field--ip mono"
-                      :class="{
-                        'is-ping': taskRt.pingState === 'running',
-                        'is-ping-fail': taskRt.pingState === 'fail' && taskConfig.abnormalPause && taskRt.running,
-                        'is-ping-flash': pingFlash
-                      }"
-                      placeholder="192.168.1.10"
-                      spellcheck="false"
-                      :title="taskRt.running ? '任务运行中不可修改' : '每轮命令跑完后 PING 这个地址，丢包率 ≤50% 算通过'"
-                    />
-                    <button
-                      @click="togglePing"
-                      :disabled="taskRt.running"
-                      class="switch"
-                      :class="{ 'is-on': taskConfig.pingEnable }"
-                      :title="taskConfig.pingEnable ? '点击关闭 PING 检测' : '点击开启 PING 检测（需先填地址）'"
-                    ><span class="switch-knob"></span><span class="switch-text">{{ taskConfig.pingEnable ? '开' : '关' }}</span></button>
-                  </div>
-                </div>
               </div>
             </div>
           </div>
@@ -2659,6 +2633,33 @@ const scrollToBottom = () => scrollLogToEnd();
           <span>点击「新增」添加命令</span>
           <span class="opacity-60">双击可编辑</span>
         </div>
+      </div>
+
+      <!-- PING：每轮命令跑完后探测一次目标地址，丢包 ≤50% 算通过。
+           放在命令列表下方、启动按钮上方：它和「跑完一轮」这件事强相关 -->
+      <div class="ping-bar">
+        <span class="ping-label">PING</span>
+        <input
+          v-model="taskConfig.pingIP"
+          @change="commitPingIP"
+          :disabled="taskRt.running"
+          class="field field--ip mono"
+          :class="{
+            'is-ping': taskRt.pingState === 'running',
+            'is-ping-fail': taskRt.pingState === 'fail' && taskConfig.abnormalPause && taskRt.running,
+            'is-ping-flash': pingFlash
+          }"
+          placeholder="192.168.1.10"
+          spellcheck="false"
+          :title="taskRt.running ? '任务运行中不可修改' : '每轮命令跑完后 PING 这个地址，丢包率 ≤50% 算通过'"
+        />
+        <button
+          @click="togglePing"
+          :disabled="taskRt.running"
+          class="switch"
+          :class="{ 'is-on': taskConfig.pingEnable }"
+          :title="taskConfig.pingEnable ? '点击关闭 PING' : '点击开启 PING（需先填地址）'"
+        ><span class="switch-knob"></span><span class="switch-text">{{ taskConfig.pingEnable ? '开' : '关' }}</span></button>
       </div>
 
       <!-- 底部：启动 / 停止（运行中沿边框均匀顺时针流光，停止时外圈呼吸灯）；异常暂停时改为两条出路 -->
@@ -3363,25 +3364,33 @@ const scrollToBottom = () => scrollLogToEnd();
 .field:disabled,
 .field.is-disabled { opacity: 0.55; cursor: not-allowed; }
 .field::placeholder { color: var(--text-sub); opacity: 0.78; }
-/* PING 检测：地址框 + 开关同排。running 时主色描边，fail 时错误色，失败瞬间闪四下（2 秒）。 */
-.setting-row--ping { height: 30px; }
-.ping-ctl {
+/* PING：贴在 AUTO CMD 命令列表下方、启动按钮上方（同一栏，26px 一行）。
+   running 时主色描边，fail 时错误色，失败瞬间闪四下（2 秒）。 */
+.ping-bar {
+  flex: none;
   display: flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  flex: 1 1 auto;
-  min-width: 0;
+  gap: 7px;
+  padding: 7px 12px;
+  border-top: 1px solid var(--line);
+}
+.ping-label {
+  flex: none;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: color-mix(in srgb, var(--text-sub) 92%, transparent);
 }
 .field--ip {
   flex: 1 1 auto;
   width: auto;
   min-width: 0;
-  height: 24px;
-  padding: 0 7px;
+  height: 26px;
+  padding: 0 8px;
   border-radius: 6px;
   font-size: 11px;
-  line-height: 22px;
+  line-height: 24px;
   letter-spacing: 0.01em;
 }
 .field--ip.is-ping {
