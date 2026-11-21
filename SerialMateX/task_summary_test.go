@@ -69,6 +69,26 @@ func TestTaskSummaryCapsFailureDetail(t *testing.T) {
 	}
 }
 
+func TestTaskSummaryCountsFailureRoundsNotEntries(t *testing.T) {
+	// 复审发现的建议问题：同一轮里「命令未完成」+「掉电失败」会记两条，
+	// 原来「失败轮次：2 轮」与「异常 1」自相矛盾。轮次数必须按轮去重。
+	s := &taskStats{}
+	s.roundsTotal, s.roundsNormal = 1, 0
+	s.addFailure(2, "cmd", "命令 2 在运行时间内没收到匹配数据")
+	s.addFailure(2, "power", "掉电失败：端口已关闭")
+	s.addFailure(3, "ping", "PING 192.168.1.10 回包 0/4，丢包 100% → 不通过")
+
+	got := formatTaskSummary(s, "任务完成", time.Now())
+	if !strings.Contains(got, "* 失败轮次：2 轮") {
+		t.Fatalf("同一轮的两条失败只能算 1 轮:\n%s", got)
+	}
+	if !strings.Contains(got, "第 2 轮：命令 2 在运行时间内没收到匹配数据") ||
+		!strings.Contains(got, "第 2 轮：掉电失败：端口已关闭") ||
+		!strings.Contains(got, "第 3 轮：PING 192.168.1.10 回包 0/4") {
+		t.Fatalf("明细行不能因为去重而丢:\n%s", got)
+	}
+}
+
 func TestTaskSummaryAppendedToLog(t *testing.T) {
 	// 第一轮 PING 通过、第二轮失败：验证 PING 的正常/异常计数与失败明细。
 	// pingRunHook 只在任务 goroutine 里被调用，计数器不需要加锁。

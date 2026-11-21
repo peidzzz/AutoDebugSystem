@@ -72,7 +72,9 @@ func loadStartupBackground() (r, g, b uint8, ok bool) {
 		return 0, 0, 0, false
 	}
 	for _, line := range strings.Split(string(raw), "\n") {
-		line = strings.TrimSpace(line)
+		// 记事本存过的文件带 UTF-8 BOM，不剥掉首行键名会变成 "\uFEFFBGCOLOR"，
+		// 于是底色「丢了」、静默回退默认浅底。
+		line = strings.TrimSpace(strings.TrimPrefix(line, "\ufeff"))
 		if line == "" || strings.HasPrefix(line, ";") || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
 			continue
 		}

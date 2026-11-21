@@ -47,10 +47,10 @@ func TestPingCountTTL(t *testing.T) {
 		out  string
 		want int
 	}{
-		"en":       {en, 2},
-		"zh":       {zh, 2},
-		"全部丢失":     {"无法访问目标主机。\r\n", 0},
-		"空输出":      {"", 0},
+		"en":   {en, 2},
+		"zh":   {zh, 2},
+		"全部丢失": {"无法访问目标主机。\r\n", 0},
+		"空输出":  {"", 0},
 	}
 	for name, c := range cases {
 		if got := pingCountTTL(c.out); got != c.want {

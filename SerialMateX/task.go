@@ -51,17 +51,18 @@ type TaskRuntime struct {
 
 // taskEngine 持有运行状态与串口送来的数据。
 type taskEngine struct {
-	mu       sync.Mutex
-	logMu    sync.Mutex // 串行化任务日志的写入（任务 goroutine 与读串口 goroutine 并发写）
-	rt       TaskRuntime
-	stopCh   chan struct{}
-	decision chan string     // 异常暂停时的决定："end" 结束任务 / "skip" 跳过本轮
-	rxBuf    strings.Builder // 最近收到的被测设备数据（用于 RX 匹配）
-	curVal   float64
-	hasCurr  bool
-	csvCnt   int
-	logPath  string
-	csvPath  string
+	mu        sync.Mutex
+	logMu     sync.Mutex // 串行化任务日志的写入（任务 goroutine 与读串口 goroutine 并发写）
+	logSealed bool       // 总结写完就封口，之后的 RX 尾巴不会再追加到总结后面（logMu 保护）
+	rt        TaskRuntime
+	stopCh    chan struct{}
+	decision  chan string     // 异常暂停时的决定："end" 结束任务 / "skip" 跳过本轮
+	rxBuf     strings.Builder // 最近收到的被测设备数据（用于 RX 匹配）
+	curVal    float64
+	hasCurr   bool
+	csvCnt    int
+	logPath   string
+	csvPath   string
 }
 
 // --- 提供给前端的接口 ---
@@ -260,6 +261,9 @@ func (t *taskEngine) reset(cfg TaskConfig) {
 	t.csvCnt = 0
 	t.stopCh = make(chan struct{})
 	t.decision = make(chan string, 1)
+	t.logMu.Lock()
+	t.logSealed = false
+	t.logMu.Unlock()
 }
 
 func (t *taskEngine) set(fn func(rt *TaskRuntime)) {
@@ -415,6 +419,25 @@ func (t *taskEngine) appendTaskLog(logPath, text string) {
 	}
 	t.logMu.Lock()
 	defer t.logMu.Unlock()
+	if t.logSealed {
+		return
+	}
+	appendFile(logPath, text)
+}
+
+// sealTaskLog 把总结写成日志的最后一段并封口：之后的 RX 数据不再追加，
+// 否则设备在收尾瞬间吐出的字节会排到「任务总结」后面（feed 在读锁里看过 Running
+// 之后才写文件，只靠 Running=false 挡不住这段尾巴）。
+func (t *taskEngine) sealTaskLog(logPath, text string) {
+	if logPath == "" {
+		return
+	}
+	t.logMu.Lock()
+	defer t.logMu.Unlock()
+	if t.logSealed {
+		return
+	}
+	t.logSealed = true
 	appendFile(logPath, text)
 }
 
@@ -428,6 +451,9 @@ func (t *taskEngine) appendMarkedLog(logPath, line string) {
 	}
 	t.logMu.Lock()
 	defer t.logMu.Unlock()
+	if t.logSealed {
+		return
+	}
 	prefix := ""
 	if last, ok := lastFileByte(logPath); ok && last != '\n' {
 		prefix = "\n"
@@ -642,26 +668,41 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 		if cfg.PingEnable && complete && !t.stopped() {
 			var pingErr error
 			pingRecv, pingErr = a.runPingCheck(cfg.PingIP)
-			passed := pingErr == nil && pingPassed(pingRecv)
-			if !t.stopped() {
-				stats.pingsTotal++
-				if passed {
-					stats.pingsNormal++
-				} else {
-					stats.addFailure(round, "ping", pingFailDetail(cfg.PingIP, pingRecv))
-				}
-				if logPath != "" {
-					t.appendMarkedLog(logPath, pingLogLine(time.Now().Format("15:04:05"), cfg.PingIP, pingRecv, passed))
-				}
-				t.set(func(rt *TaskRuntime) {
-					if passed {
-						rt.PingState = "ok"
-					} else {
-						rt.PingState = "fail"
-					}
-				})
-				pingFailed = !passed
+			// 用户正好在 PING 期间点了停止：这一轮同样要进统计，并且按失败算。
+			// （以前这里整段被跳过，于是该轮被算成「正常 1」，总结里 PING 总数还是 0。）
+			cancelled := t.stopped()
+			passed := !cancelled && pingErr == nil && pingPassed(pingRecv)
+			pingFailed = !passed
+
+			stats.pingsTotal++
+			switch {
+			case passed:
+				stats.pingsNormal++
+			case cancelled:
+				stats.addFailure(round, "ping", pingCancelDetail(cfg.PingIP))
+			case pingErr != nil:
+				stats.addFailure(round, "ping", pingFailDetailErr(cfg.PingIP, pingRecv, pingErr))
+			default:
+				stats.addFailure(round, "ping", pingFailDetail(cfg.PingIP, pingRecv))
 			}
+			if logPath != "" {
+				at := time.Now().Format("15:04:05")
+				switch {
+				case cancelled:
+					t.appendMarkedLog(logPath, pingCancelLine(at, cfg.PingIP))
+				case pingErr != nil:
+					t.appendMarkedLog(logPath, pingLogLineErr(at, cfg.PingIP, pingErr))
+				default:
+					t.appendMarkedLog(logPath, pingLogLine(at, cfg.PingIP, pingRecv, passed))
+				}
+			}
+			t.set(func(rt *TaskRuntime) {
+				if passed {
+					rt.PingState = "ok"
+				} else {
+					rt.PingState = "fail"
+				}
+			})
 		}
 
 		// 异常暂停：等界面给出决定。停止（stopCh）也按“结束任务”处理，
@@ -767,6 +808,13 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 	case endMsg != "":
 		finalMsg = endMsg
 	}
+	// 统计块写在最后：日志是用户唯一的复盘入口，不能少这一块。
+	// 先落盘再置 Running=false —— 顺序反过来时，读串口线程可能在这两步之间
+	// 把设备吐出的尾巴数据写进日志，总结就不再是最后一段了。
+	if logPath != "" {
+		t.sealTaskLog(logPath, formatTaskSummary(stats, finalMsg, time.Now()))
+	}
+
 	t.set(func(rt *TaskRuntime) {
 		rt.Message = finalMsg
 		rt.Running = false
@@ -779,12 +827,10 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 		rt.CmdIndex = -1
 		rt.CmdPhase = ""
 		rt.CmdCountdown = 0
+		// 界面在任务结束后就不再轮询了，最后一帧的 PingState 会一直留在界面上
+		// （主色描边像“还在检测”、红框像“刚失败”），所以必须在这里清空。
+		rt.PingState = ""
 	})
-
-	// 统计块写在最后：日志是用户唯一的复盘入口，不能少这一块。
-	if logPath != "" {
-		t.appendTaskLog(logPath, formatTaskSummary(stats, finalMsg, time.Now()))
-	}
 }
 
 // runCommands 在 deadline 之前依次执行命令；complete 为 false 时 reason 说明卡在哪一步

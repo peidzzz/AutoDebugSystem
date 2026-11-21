@@ -61,6 +61,21 @@ func TestLoadStartupBackground(t *testing.T) {
 	}
 }
 
+func TestLoadStartupBackgroundWithBOM(t *testing.T) {
+	// 用记事本存过一次 ui_config.ini 会带 UTF-8 BOM，首行键名会变成 \uFEFFBGCOLOR，
+	// 不剥 BOM 就会静默回退默认浅底（底色「丢」了）。
+	dir := t.TempDir()
+	t.Setenv("SERIALMATEX_UICFG_DIR", dir)
+	path := filepath.Join(dir, uiCfgFileName)
+	if err := os.WriteFile(path, []byte("\ufeff[UI]\nBG-COLOR=#1E1E1E\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, g, b, ok := loadStartupBackground()
+	if !ok || r != 30 || g != 30 || b != 30 {
+		t.Fatalf("带 BOM 的文件读到 (%d,%d,%d,%v)，期望 (30,30,30,true)", r, g, b, ok)
+	}
+}
+
 func TestSaveUIBackground(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("SERIALMATEX_UICFG_DIR", dir)

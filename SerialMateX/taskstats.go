@@ -26,13 +26,25 @@ type taskStats struct {
 	pingsNormal  int
 	pingEnabled  bool
 	failures     []roundFailure
-	overflow     int // 超过 maxRecordedFailures、没能逐条记下的失败轮数
+	// 失败「轮次」数按轮去重：同一轮里命令未完成 + 掉电失败会记两条明细，
+	// 但总结里的「失败轮次：N 轮」必须与「异常 N」对得上。
+	failureRounds     int
+	lastFailureRound  int
+	overflow          int // 没能逐条列出、且已被计入 failureRounds 的轮数
+	lastOverflowRound int
 }
 
-// addFailure 记一轮失败；超过上限只累加 overflow。
+// addFailure 记一轮失败；超过上限只累加 overflow（同样按轮计）。
 func (s *taskStats) addFailure(round int, kind, detail string) {
+	if round != s.lastFailureRound {
+		s.lastFailureRound = round
+		s.failureRounds++
+	}
 	if len(s.failures) >= maxRecordedFailures {
-		s.overflow++
+		if round != s.lastOverflowRound {
+			s.lastOverflowRound = round
+			s.overflow++
+		}
 		return
 	}
 	s.failures = append(s.failures, roundFailure{Round: round, Kind: kind, Detail: detail})
@@ -62,9 +74,9 @@ func formatTaskSummary(s *taskStats, endReason string, endedAt time.Time) string
 			" / 总数 " + strconv.Itoa(s.pingsTotal) + "\n")
 	}
 
-	if total := len(s.failures) + s.overflow; total > 0 {
+	if s.failureRounds > 0 {
 		b.WriteString("----------------------------------------\n")
-		b.WriteString("* 失败轮次：" + strconv.Itoa(total) + " 轮\n")
+		b.WriteString("* 失败轮次：" + strconv.Itoa(s.failureRounds) + " 轮\n")
 		for _, f := range s.failures {
 			b.WriteString("  - 第 " + strconv.Itoa(f.Round) + " 轮：" + f.Detail + "\n")
 		}

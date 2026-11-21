@@ -34,7 +34,8 @@ func TestTaskPingPassKeepsNormalCount(t *testing.T) {
 		func(ctx context.Context, ip string) (int, error) { return 4, nil })
 
 	rt := waitTaskDone(t, app, 8*time.Second)
-	if rt.NormalCount != 1 || rt.PingState != "ok" {
+	// 任务结束后 PingState 会被清空（否则界面描边会一直亮着），所以这里只断言计数与日志。
+	if rt.NormalCount != 1 {
 		t.Fatalf("PING 通过应计正常: %+v", rt)
 	}
 	if log := readTaskLog(t); !strings.Contains(log, "[PING ") || !strings.Contains(log, "→ 通过") {
@@ -68,11 +69,12 @@ func TestTaskPingToolMissingDoesNotCrash(t *testing.T) {
 		func(ctx context.Context, ip string) (int, error) { return 0, exec.ErrNotFound })
 
 	rt := waitTaskDone(t, app, 8*time.Second)
-	if rt.NormalCount != 0 || rt.PingState != "fail" {
+	if rt.NormalCount != 0 {
 		t.Fatalf("PING 工具不可用应按未通过: %+v", rt)
 	}
-	if log := readTaskLog(t); !strings.Contains(log, "→ 不通过") {
-		t.Fatalf("日志应记未通过:\n%s", log)
+	log := readTaskLog(t)
+	if !strings.Contains(log, "无法执行 ping") {
+		t.Fatalf("日志应写明 ping 无法执行（而不是伪装成丢包 100%%）:\n%s", log)
 	}
 }
 
@@ -116,6 +118,74 @@ func TestTaskPingOnlyTaskWithoutCommands(t *testing.T) {
 	rt := waitTaskDone(t, app, 10*time.Second)
 	if rt.NormalCount != 2 || rt.RunCount != 2 {
 		t.Fatalf("空命令列表应只靠 PING 计正常: %+v", rt)
+	}
+}
+
+func TestTaskStopDuringPingCountsAbnormalRound(t *testing.T) {
+	// 复审发现的严重问题：PING 期间点停止，原来既不给 PING 记异常、还把这轮算成「正常」，
+	// 结果日志写「结束原因：任务已停止」，总结却是「正常 1 / 总数 1」「PING 0/0/0」。
+	entered := make(chan struct{})
+	app := startPingTask(t,
+		"[Task]\nSaveLog=1\nAbnormalPause=1\nWaitSeconds=1\nDelaySeconds=0\nRunCount=5\nPingEnable=1\nPingIP=192.168.1.10\n",
+		"TX AT 0\n",
+		func(ctx context.Context, ip string) (int, error) {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-ctx.Done()
+			return 0, ctx.Err()
+		})
+
+	<-entered
+	if res := app.StopTask(); res != "" {
+		t.Fatalf("StopTask: %s", res)
+	}
+	rt := waitTaskDone(t, app, 3*time.Second)
+	if rt.NormalCount != 0 {
+		t.Fatalf("被停止打断的轮次不能算正常: %+v", rt)
+	}
+	if rt.PingState != "" {
+		t.Fatalf("任务结束后 PingState 必须清空，否则界面描边会一直亮着: %q", rt.PingState)
+	}
+	log := readTaskLog(t)
+	for _, want := range []string{
+		"* 总测试轮数：正常 0 / 异常 1 / 总数 1",
+		"* PING 检测： 正常 0 / 异常 1 / 总数 1",
+		"被停止打断",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("日志缺少 %q，实际:\n%s", want, log)
+		}
+	}
+}
+
+func TestTaskPingFailStateClearedAtTaskEnd(t *testing.T) {
+	// 最后一轮 PING 失败时，红框只该保持到任务结束，不能固化在界面上。
+	app := startPingTask(t,
+		"[Task]\nSaveLog=0\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\nPingEnable=1\nPingIP=192.168.1.10\n",
+		"TX AT 0\n",
+		func(ctx context.Context, ip string) (int, error) { return 1, nil })
+
+	rt := waitTaskDone(t, app, 8*time.Second)
+	if rt.PingState != "" {
+		t.Fatalf("任务结束后 PingState 必须清空，实际 %q", rt.PingState)
+	}
+}
+
+func TestPingFailDetailMentionsToolError(t *testing.T) {
+	// ping.exe 缺失/被杀/超时不能都伪装成「丢包 100%」，否则用户查不出是工具问题。
+	got := pingFailDetailErr("192.168.1.10", 0, exec.ErrNotFound)
+	if !strings.Contains(got, "无法执行 ping") || !strings.Contains(got, exec.ErrNotFound.Error()) {
+		t.Fatalf("明细没带上工具错误: %q", got)
+	}
+}
+
+func TestPingProbePropagatesContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := pingProbe(ctx, "192.168.1.10"); err == nil {
+		t.Fatal("ctx 已取消时 pingProbe 必须返回错误，而不是 (0,nil)")
 	}
 }
 

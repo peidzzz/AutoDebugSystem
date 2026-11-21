@@ -83,8 +83,33 @@ func pingFailDetail(ip string, recv int) string {
 		ip, recv, pingPacketCount, pingLossRate(recv), pingVerdict(false))
 }
 
+// pingFailDetailErr 用于 ping 根本没能执行的情况（找不到 ping.exe、被安全软件杀掉、超时）。
+// 这种失败和「丢包 100%」是两回事，不提工具错误用户查不出来。
+func pingFailDetailErr(ip string, recv int, err error) string {
+	if err == nil {
+		return pingFailDetail(ip, recv)
+	}
+	return fmt.Sprintf("PING %s 无法执行 ping：%v", ip, err)
+}
+
+// pingCancelDetail 是 PING 被用户点停止打断时的失败明细。
+func pingCancelDetail(ip string) string {
+	return "PING " + ip + " 被停止打断"
+}
+
+// pingCancelLine 是 PING 被打断时写进日志的单行。
+func pingCancelLine(at, ip string) string {
+	return fmt.Sprintf("[PING %s] %s 检测被停止打断\n", at, ip)
+}
+
+// pingLogLineErr 是 ping 根本没能执行时写进日志的单行。
+func pingLogLineErr(at, ip string, err error) string {
+	return fmt.Sprintf("[PING %s] %s 无法执行 ping：%v\n", at, ip, err)
+}
+
 // pingProbe 调用系统 ping.exe 发 4 个包，返回成功回包数（0..4）。
-// ping.exe 在有丢包时会返回退出码 1，这里按正常结果处理，不当作错误。
+// ping.exe 在有丢包时会返回退出码 1，这里按正常结果处理，不当作错误；
+// 但 ctx 被取消（用户点停止 / 超时）必须如实返回错误，不能伪装成丢包 100%。
 func pingProbe(ctx context.Context, ip string) (int, error) {
 	if pingRunHook != nil {
 		return pingRunHook(ctx, ip)
@@ -94,6 +119,9 @@ func pingProbe(ctx context.Context, ip string) (int, error) {
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	if err := cmd.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, ctxErr
+		}
 		if _, ok := err.(*exec.ExitError); !ok {
 			return 0, err
 		}

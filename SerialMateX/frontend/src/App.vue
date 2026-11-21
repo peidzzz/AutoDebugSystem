@@ -393,23 +393,38 @@ const toggleTaskFlag = async (key: TaskFlagKey) => {
   await persistTaskConfig();
 };
 
-// 勾选框 / 数字改动后立即落盘
-const persistTaskConfig = async () => {
+// 勾选框 / 数字改动后立即落盘。返回落盘后的配置文件路径，失败返回 null（调用方据此回滚）。
+// 在途的保存会被记下来：输入框失焦触发保存后立刻点「启动」时，StartTask 读的是磁盘，
+// 不等这一次写完就可能第一轮还在用旧地址。
+let pendingTaskSave: Promise<unknown> | null = null;
+const persistTaskConfig = async (): Promise<string | null> => {
+  const run = (async () => {
+    try {
+      await SaveTaskConfig(taskConfig.value as unknown as any);
+      taskCfgPath.value = await GetTaskCfgPath();
+      return taskCfgPath.value;
+    } catch (e) {
+      showModal('保存任务参数失败', String(e), 'error');
+      return null;
+    }
+  })();
+  pendingTaskSave = run;
   try {
-    await SaveTaskConfig(taskConfig.value as unknown as any);
-    taskCfgPath.value = await GetTaskCfgPath();
-  } catch (e) {
-    showModal('保存任务参数失败', String(e), 'error');
+    return await run;
+  } finally {
+    if (pendingTaskSave === run) pendingTaskSave = null;
   }
 };
 
-// PING 目标地址：与后端 validIPv4 同规则（四段十进制 0–255，0.0.0.0 不算）
+// PING 目标地址：与后端 validIPv4 同规则（四段十进制 0–255，无前导零，0.0.0.0 不算）
 const isValidIPv4 = (value: string): boolean => {
   const text = value.trim();
   if (text === '0.0.0.0') return false;
   const parts = text.split('.');
   if (parts.length !== 4) return false;
-  return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255);
+  // 前导零（192.168.01.1）后端 net.ParseIP 直接拒，前端放过去就会变成
+  // 「开关显示已开、StartTask 读到 0、整场测试一次也不 PING」。
+  return parts.every((p) => /^\d{1,3}$/.test(p) && (p === '0' || !p.startsWith('0')) && Number(p) <= 255);
 };
 
 // 上次落盘成功的地址：输入非法时回滚到它，别在界面上留一个没保存的值
@@ -426,20 +441,30 @@ const flashPingFail = () => {
   }, 2000);
 };
 
-// 开关：地址不合法时点开启直接报错，不允许“开着但没地址”的状态
+// 开关：地址不合法时点开启直接报错，不允许“开着但没地址”的状态。
+// 保存失败必须把开关翻回去 —— 否则界面显示「已开」、磁盘里还是 0，
+// 任务照样启动却一次也不 PING（正是要避免的静默失效）。
 const togglePing = async () => {
   if (taskRt.value.running) return;
   if (!taskConfig.value.pingEnable && !isValidIPv4(taskConfig.value.pingIP)) {
     showModal('PING 目标地址无效', '请先填写合法的 IPv4 地址，例如 192.168.1.10', 'error');
     return;
   }
-  taskConfig.value.pingEnable = !taskConfig.value.pingEnable;
-  await persistTaskConfig();
+  const wanted = !taskConfig.value.pingEnable;
+  taskConfig.value.pingEnable = wanted;
+  const path = await persistTaskConfig();
+  if (path === null) {
+    taskConfig.value.pingEnable = !wanted;
+  }
 };
 
-// 地址框：失焦 / 回车才落盘（v-model.lazy + @change）；非法则弹错并还原上次的值
+// 地址框：失焦 / 回车才落盘（v-model + @change）；非法则弹错并还原上次的值
 const commitPingIP = async () => {
-  if (taskRt.value.running) return;
+  if (taskRt.value.running) {
+    // 运行中不允许改地址；模型里留着用户刚敲的值会与磁盘不一致，直接还原。
+    taskConfig.value.pingIP = lastSavedPingIP.value;
+    return;
+  }
   const value = taskConfig.value.pingIP.trim();
   taskConfig.value.pingIP = value;
   if (value === lastSavedPingIP.value) return;
@@ -468,7 +493,18 @@ const commitPingIP = async () => {
 watch(
   () => taskRt.value.pingState,
   (state) => {
-    if (state === 'fail') flashPingFail();
+    if (state === 'fail') {
+      flashPingFail();
+      return;
+    }
+    // 任务结束（pingState 被后端清空）时立刻收掉闪烁，别让红框在收工后继续响。
+    if (state === '') {
+      if (pingFlashTimer !== null) {
+        window.clearTimeout(pingFlashTimer);
+        pingFlashTimer = null;
+      }
+      pingFlash.value = false;
+    }
   }
 );
 
@@ -776,6 +812,15 @@ const toggleAutoRun = async () => {
     if (res) showModal('停止失败', res, 'error');
     await pollTaskRuntime();
     return;
+  }
+  // 先把在途的任务参数保存等完：StartTask 从磁盘读 task_config.ini，
+  // 不等待就可能第一轮还用着旧 PING 地址，而界面显示的是新地址。
+  if (pendingTaskSave) {
+    try {
+      await pendingTaskSave;
+    } catch {
+      /* 保存失败已经弹过窗，是否启动交给用户判断 */
+    }
   }
   const res = await StartTask({ deviceName: selectedDeviceName.value, eol: taskEol() });
   if (res) {
@@ -1673,6 +1718,10 @@ onUnmounted(() => {
     clearTimeout(broomAnimationTimer);
     broomAnimationTimer = null;
   }
+  if (pingFlashTimer !== null) {
+    window.clearTimeout(pingFlashTimer);
+    pingFlashTimer = null;
+  }
   document.removeEventListener('paste', onDocumentPaste);
   stopProcessingLoop();
   stopTaskPolling();
@@ -2380,7 +2429,7 @@ const scrollToBottom = () => scrollLogToEnd();
                       class="field field--ip mono"
                       :class="{
                         'is-ping': taskRt.pingState === 'running',
-                        'is-ping-fail': taskRt.pingState === 'fail',
+                        'is-ping-fail': taskRt.pingState === 'fail' && taskConfig.abnormalPause && taskRt.running,
                         'is-ping-flash': pingFlash
                       }"
                       placeholder="192.168.1.10"
@@ -3340,6 +3389,8 @@ const scrollToBottom = () => scrollLogToEnd();
   box-shadow: 0 0 0 2px var(--accent-ring);
 }
 .field--ip.is-ping-fail {
+  /* 只在「开了异常暂停 + 正在跑」时定格红底：此时任务真的停住了，红底就是暂停原因 */
+  background: color-mix(in srgb, var(--col-error) 16%, var(--field));
   border-color: color-mix(in srgb, var(--col-error) 62%, transparent);
   color: var(--col-error);
 }

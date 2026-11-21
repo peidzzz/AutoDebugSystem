@@ -48,6 +48,24 @@ func TestTaskCfgSaveRejectsBadPingIP(t *testing.T) {
 	}
 }
 
+func TestTaskCfgPingIPIgnoresInlineComment(t *testing.T) {
+	// 手改 ini 常写成「PingIP=192.168.1.10 ; 目标」，原来整串进了 PingIP，
+	// StartTask 直接拒绝启动，而其它键遇到同样写法只是回落默认值。
+	dir := t.TempDir()
+	t.Setenv("SERIALMATEX_TASKCFG_DIR", dir)
+	body := "[Task]\nPingEnable=1\nPingIP=192.168.1.10 ; 目标地址\nRunCount=1\n"
+	if err := os.WriteFile(filepath.Join(dir, "task_config.ini"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := (&App{}).GetTaskConfig()
+	if cfg.PingIP != "192.168.1.10" {
+		t.Fatalf("行内注释没被剥掉: %q", cfg.PingIP)
+	}
+	if !cfg.PingEnable {
+		t.Fatalf("开关没解析出来: %+v", cfg)
+	}
+}
+
 func TestTaskCfgSaveAllowsDisableWithBadPingIP(t *testing.T) {
 	// 手改 ini 弄出坏地址后，用户必须还能把开关关掉
 	dir := t.TempDir()

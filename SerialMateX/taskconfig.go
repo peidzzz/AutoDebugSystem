@@ -11,15 +11,15 @@ import (
 
 // TaskConfig 是 task_config.ini 中的任务参数（TASK 页下半部分）。
 type TaskConfig struct {
-	SaveLog       bool `json:"saveLog"`       // 保存日志
-	SavePower     bool `json:"savePower"`     // 保存功耗
-	InitialState  bool `json:"initialState"`  // 初始状态（开 / 关）
-	AbnormalPause bool `json:"abnormalPause"` // 异常暂停（开 / 关）
-	WaitSeconds  int  `json:"waitSeconds"`  // 运行时间（秒）
-	DelaySeconds int  `json:"delaySeconds"` // 间隔时间（秒）
-	RunCount     int  `json:"runCount"`     // 运行次数（次）
-	PingEnable   bool   `json:"pingEnable"` // PING 检测（每轮命令跑完后 ping 目标地址）
-	PingIP       string `json:"pingIP"`     // PING 目标地址（IPv4）
+	SaveLog       bool   `json:"saveLog"`       // 保存日志
+	SavePower     bool   `json:"savePower"`     // 保存功耗
+	InitialState  bool   `json:"initialState"`  // 初始状态（开 / 关）
+	AbnormalPause bool   `json:"abnormalPause"` // 异常暂停（开 / 关）
+	WaitSeconds   int    `json:"waitSeconds"`   // 运行时间（秒）
+	DelaySeconds  int    `json:"delaySeconds"`  // 间隔时间（秒）
+	RunCount      int    `json:"runCount"`      // 运行次数（次）
+	PingEnable    bool   `json:"pingEnable"`    // PING 检测（每轮命令跑完后 ping 目标地址）
+	PingIP        string `json:"pingIP"`        // PING 目标地址（IPv4）
 }
 
 const taskCfgFileName = "task_config.ini"
@@ -108,6 +108,11 @@ func (a *App) GetTaskConfig() TaskConfig {
 		}
 		key = strings.ToUpper(strings.NewReplacer("-", "", "_", "", " ", "").Replace(strings.TrimSpace(key)))
 		value = strings.TrimSpace(value)
+		// 行内注释：PingIP=192.168.1.10 ; 目标地址 这种人写的写法不能整串当成值，
+		// 否则 StartTask 会以「PING 目标地址无效」拒绝启动。
+		if i := strings.IndexAny(value, ";#"); i >= 0 {
+			value = strings.TrimSpace(value[:i])
+		}
 		switch key {
 		case "SAVELOG":
 			cfg.SaveLog = parseBoolValue(value)
