@@ -125,3 +125,7 @@ export function StartTask(arg1) {
 export function StopTask() {
   return window['go']['main']['App']['StopTask']();
 }
+
+export function SaveUIBackground(arg1) {
+  return window['go']['main']['App']['SaveUIBackground'](arg1);
+}

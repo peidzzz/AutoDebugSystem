@@ -65,3 +65,5 @@ export function SkipRound():Promise<string>;
 export function StartTask(arg1:main.TaskRunOptions):Promise<string>;
 
 export function StopTask():Promise<string>;
+
+export function SaveUIBackground(arg1:string):Promise<string>;

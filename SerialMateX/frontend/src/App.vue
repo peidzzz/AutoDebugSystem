@@ -28,7 +28,7 @@ use([
 provide(THEME_KEY, 'dark'); // Or dynamics based on app theme
 
 // 引入后端方法 (GetVersion, CheckForUpdates, DownloadAndInstallUpdate, QuitApp)
-import { GetSerialPorts, OpenSerial, OpenTcpClient, OpenTcpServer, OpenUdp, Close as CloseConnection, SendData, GetVersion, CheckForUpdates, DownloadAndInstallUpdate, QuitApp, GetPwrDevices, GetPwrDevPath, SavePwrDevices, GetTaskConfig, SaveTaskConfig, GetTaskCfgPath, GetAutoCmds, SaveAutoCmds, GetAutoCmdPath, StartTask, StopTask, EndTask, SkipRound, GetTaskRuntime, ImportAutoCmds } from '../wailsjs/go/main/App';
+import { GetSerialPorts, OpenSerial, OpenTcpClient, OpenTcpServer, OpenUdp, Close as CloseConnection, SendData, GetVersion, CheckForUpdates, DownloadAndInstallUpdate, QuitApp, GetPwrDevices, GetPwrDevPath, SavePwrDevices, GetTaskConfig, SaveTaskConfig, GetTaskCfgPath, GetAutoCmds, SaveAutoCmds, GetAutoCmdPath, StartTask, StopTask, EndTask, SkipRound, GetTaskRuntime, ImportAutoCmds, SaveUIBackground } from '../wailsjs/go/main/App';
 import { EventsOn } from '../wailsjs/runtime/runtime';
 import { shallowRef } from 'vue';
 
@@ -297,8 +297,11 @@ interface TaskConfigModel {
   waitSeconds: number;
   delaySeconds: number;
   runCount: number;
+  // PING 检测：每轮命令跑完、掉电倒计时结束前 ping 一次目标地址
+  pingEnable: boolean;
+  pingIP: string;
 }
-const taskConfig = ref<TaskConfigModel>({ saveLog: false, savePower: false, initialState: false, abnormalPause: false, waitSeconds: 5, delaySeconds: 1, runCount: 1 });
+const taskConfig = ref<TaskConfigModel>({ saveLog: false, savePower: false, initialState: false, abnormalPause: false, waitSeconds: 5, delaySeconds: 1, runCount: 1, pingEnable: false, pingIP: '' });
 const taskCfgPath = ref('');
 
 // TASK STATUS：运行时的实时状态（当前轮次 / 电源状态 / 当前电流）
@@ -322,6 +325,8 @@ interface TaskRuntimeModel {
   logPath: string;
   csvPath: string;
   message: string;
+  // PING 检测状态：'' 本轮没测 / running 正在 ping / ok 通过 / fail 不通过
+  pingState: string;
 }
 const emptyRuntime = (): TaskRuntimeModel => ({
   running: false,
@@ -340,7 +345,8 @@ const emptyRuntime = (): TaskRuntimeModel => ({
   cmdCountdown: 0,
   logPath: '',
   csvPath: '',
-  message: ''
+  message: '',
+  pingState: ''
 });
 const taskRt = ref<TaskRuntimeModel>(emptyRuntime());
 const taskStatus = reactive({ round: 0, power: 'OFF' as 'ON' | 'OFF', current: null as number | null });
@@ -366,8 +372,11 @@ const loadTaskConfig = async () => {
         abnormalPause: !!(cfg as any).abnormalPause,
         waitSeconds: Number(cfg.waitSeconds ?? 5),
         delaySeconds: Number(cfg.delaySeconds ?? 1),
-        runCount: Number(cfg.runCount ?? 1)
+        runCount: Number(cfg.runCount ?? 1),
+        pingEnable: !!(cfg as any).pingEnable,
+        pingIP: String((cfg as any).pingIP ?? '')
       };
+      lastSavedPingIP.value = taskConfig.value.pingIP;
     }
     taskCfgPath.value = await GetTaskCfgPath();
   } catch (e) {
@@ -393,6 +402,75 @@ const persistTaskConfig = async () => {
     showModal('保存任务参数失败', String(e), 'error');
   }
 };
+
+// PING 目标地址：与后端 validIPv4 同规则（四段十进制 0–255，0.0.0.0 不算）
+const isValidIPv4 = (value: string): boolean => {
+  const text = value.trim();
+  if (text === '0.0.0.0') return false;
+  const parts = text.split('.');
+  if (parts.length !== 4) return false;
+  return parts.every((p) => /^\d{1,3}$/.test(p) && Number(p) <= 255);
+};
+
+// 上次落盘成功的地址：输入非法时回滚到它，别在界面上留一个没保存的值
+const lastSavedPingIP = ref<string>('');
+// PING 失败瞬间给地址框闪一下错误色（2 秒）；没开日志、没开异常暂停时这是唯一的反馈
+const pingFlash = ref(false);
+let pingFlashTimer: number | null = null;
+const flashPingFail = () => {
+  if (pingFlashTimer !== null) window.clearTimeout(pingFlashTimer);
+  pingFlash.value = true;
+  pingFlashTimer = window.setTimeout(() => {
+    pingFlash.value = false;
+    pingFlashTimer = null;
+  }, 2000);
+};
+
+// 开关：地址不合法时点开启直接报错，不允许“开着但没地址”的状态
+const togglePing = async () => {
+  if (taskRt.value.running) return;
+  if (!taskConfig.value.pingEnable && !isValidIPv4(taskConfig.value.pingIP)) {
+    showModal('PING 目标地址无效', '请先填写合法的 IPv4 地址，例如 192.168.1.10', 'error');
+    return;
+  }
+  taskConfig.value.pingEnable = !taskConfig.value.pingEnable;
+  await persistTaskConfig();
+};
+
+// 地址框：失焦 / 回车才落盘（v-model.lazy + @change）；非法则弹错并还原上次的值
+const commitPingIP = async () => {
+  if (taskRt.value.running) return;
+  const value = taskConfig.value.pingIP.trim();
+  taskConfig.value.pingIP = value;
+  if (value === lastSavedPingIP.value) return;
+  if (value !== '' && !isValidIPv4(value)) {
+    showModal('PING 目标地址无效', `「${value}」不是合法的 IPv4 地址，例如 192.168.1.10`, 'error');
+    taskConfig.value.pingIP = lastSavedPingIP.value;
+    return;
+  }
+  if (value === '' && taskConfig.value.pingEnable) {
+    showModal('PING 目标地址无效', '开启 PING 检测时地址不能为空', 'error');
+    taskConfig.value.pingIP = lastSavedPingIP.value;
+    return;
+  }
+  const previous = lastSavedPingIP.value;
+  lastSavedPingIP.value = value;
+  try {
+    await SaveTaskConfig(taskConfig.value as unknown as any);
+    taskCfgPath.value = await GetTaskCfgPath();
+  } catch (e) {
+    lastSavedPingIP.value = previous;
+    taskConfig.value.pingIP = previous;
+    showModal('保存任务参数失败', String(e), 'error');
+  }
+};
+
+watch(
+  () => taskRt.value.pingState,
+  (state) => {
+    if (state === 'fail') flashPingFail();
+  }
+);
 
 // 点击数字 → 弹窗编辑（保存 / 取消）
 type TaskNumberKey = 'waitSeconds' | 'delaySeconds' | 'runCount';
@@ -1336,10 +1414,22 @@ const cssVars = computed(() => ({
 }));
 
 // 一键换肤：切换皮肤 + 立即落盘，下次启动按保存的皮肤加载
+// 把当前皮肤的底色写给 Go 侧（下次启动 WebView2 还没画第一帧时用它）。
+// 绑定缺失 / 目录只读都不影响使用，一律静默忽略。
+const syncUiBackground = (hex: string) => {
+  try {
+    void SaveUIBackground(hex).catch(() => { /* 忽略 */ });
+  } catch {
+    /* 忽略：老版本绑定里没有这个方法 */
+  }
+};
+
 const applySkin = (id: SkinId) => {
   activeSkin.value = id;
-  Object.assign(theme, (SKINS.find((s) => s.id === id) ?? SKINS[0]).theme);
+  const skin = SKINS.find((s) => s.id === id) ?? SKINS[0];
+  Object.assign(theme, skin.theme);
   try { localStorage.setItem(SKIN_STORAGE_KEY, id); } catch { /* 忽略存储失败 */ }
+  syncUiBackground(skin.theme.bgMain);
   showSkinPanel.value = false;
 };
 
@@ -1519,6 +1609,10 @@ onMounted(async () => {
   await loadTaskConfig();
   // 右侧栏 AUTO CMD：读取 auto_cmd.txt（不存在时自动创建）
   await loadAutoCmds();
+
+  // 把当前皮肤的底色同步给 Go 侧（下次启动先铺这个色，避免闪默认色）。
+  // 首次运行时 ui_config.ini 还不存在，这次调用会顺手把它建起来。
+  syncUiBackground(theme.bgMain);
 
   // 数据接收监听
   EventsOn("serial-data", (data: any) => {
@@ -2276,6 +2370,32 @@ const scrollToBottom = () => scrollLogToEnd();
                     <span class="tabular-nums">{{ taskConfig.runCount }}</span><span class="chip-unit">次</span>
                   </button>
                 </div>
+                <div class="setting-row setting-row--ping">
+                  <span class="setting-label">PING 检测</span>
+                  <div class="ping-ctl">
+                    <input
+                      v-model="taskConfig.pingIP"
+                      @change="commitPingIP"
+                      :disabled="taskRt.running"
+                      class="field field--ip mono"
+                      :class="{
+                        'is-ping': taskRt.pingState === 'running',
+                        'is-ping-fail': taskRt.pingState === 'fail',
+                        'is-ping-flash': pingFlash
+                      }"
+                      placeholder="192.168.1.10"
+                      spellcheck="false"
+                      :title="taskRt.running ? '任务运行中不可修改' : '每轮命令跑完后 PING 这个地址，丢包率 ≤50% 算通过'"
+                    />
+                    <button
+                      @click="togglePing"
+                      :disabled="taskRt.running"
+                      class="switch"
+                      :class="{ 'is-on': taskConfig.pingEnable }"
+                      :title="taskConfig.pingEnable ? '点击关闭 PING 检测' : '点击开启 PING 检测（需先填地址）'"
+                    ><span class="switch-knob"></span><span class="switch-text">{{ taskConfig.pingEnable ? '开' : '关' }}</span></button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -2308,6 +2428,7 @@ const scrollToBottom = () => scrollLogToEnd();
                 <template v-if="taskRt.running && taskRt.countdown > 0 && taskRt.countdownTo">
                   {{ taskRt.countdown }} 秒后{{ taskRt.countdownTo === 'powerOn' ? '上电' : '掉电' }}
                 </template>
+                <template v-else-if="taskRt.phase === 'ping'">PING 检测中…</template>
                 <template v-else-if="taskRt.paused">已暂停</template>
                 <template v-else>—</template>
               </span>
@@ -3193,6 +3314,53 @@ const scrollToBottom = () => scrollLogToEnd();
 .field:disabled,
 .field.is-disabled { opacity: 0.55; cursor: not-allowed; }
 .field::placeholder { color: var(--text-sub); opacity: 0.78; }
+/* PING 检测：地址框 + 开关同排。running 时主色描边，fail 时错误色，失败瞬间闪四下（2 秒）。 */
+.setting-row--ping { height: 30px; }
+.ping-ctl {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.field--ip {
+  flex: 1 1 auto;
+  width: auto;
+  min-width: 0;
+  height: 24px;
+  padding: 0 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 22px;
+  letter-spacing: 0.01em;
+}
+.field--ip.is-ping {
+  border-color: color-mix(in srgb, var(--col-primary) 55%, transparent);
+  box-shadow: 0 0 0 2px var(--accent-ring);
+}
+.field--ip.is-ping-fail {
+  border-color: color-mix(in srgb, var(--col-error) 62%, transparent);
+  color: var(--col-error);
+}
+.field--ip.is-ping-flash {
+  animation: ping-flash 0.5s ease-in-out 4;
+}
+@keyframes ping-flash {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+  50% {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--col-error) 45%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .field--ip.is-ping-flash {
+    animation: none;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--col-error) 45%, transparent);
+  }
+}
 .field--btn {
   display: flex;
   align-items: center;
