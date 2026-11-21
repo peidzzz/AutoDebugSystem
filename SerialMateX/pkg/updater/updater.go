@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	GitHubRepo   = "TheWinds071/serial-mate"
+	GitHubRepo   = "peidzzz/AutoDebugSystem"
 	CheckTimeout = 10 * time.Second
 	// OldExeCleanupDelay is the delay before cleaning up the old executable after update
 	OldExeCleanupDelay = 5 * time.Second
@@ -237,11 +237,11 @@ func InstallUpdate(updateFile string) error {
 func getAssetName() string {
 	switch runtime.GOOS {
 	case "windows":
-		return "serial-mate-windows-amd64.exe"
+		return "SerialMateX.exe"
 	case "darwin":
-		return "serial-mate-macos-universal.app.zip"
+		return "SerialMateX-macos-universal.app.zip"
 	case "linux":
-		return "serial-mate-linux-amd64"
+		return "SerialMateX-linux-amd64"
 	default:
 		return ""
 	}

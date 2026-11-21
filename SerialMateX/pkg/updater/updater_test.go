@@ -39,9 +39,9 @@ func TestGetAssetName(t *testing.T) {
 
 	// Asset name should contain the platform-specific naming
 	expectedNames := []string{
-		"serial-mate-windows-amd64.exe",
-		"serial-mate-macos-universal.app.zip",
-		"serial-mate-linux-amd64",
+		"SerialMateX.exe",
+		"SerialMateX-macos-universal.app.zip",
+		"SerialMateX-linux-amd64",
 	}
 
 	found := false

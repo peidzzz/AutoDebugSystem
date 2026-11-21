@@ -74,8 +74,8 @@ func run(icoPath, manifestPath, target string) error {
 	// wails 的 info.json 是 go-winres 模板（值全是 {{.Info.X}}），而 wails.json 没有 info 段，
 	// 直接套模板只会得到空字符串，所以这里把展示用的字段写死。
 	vi := version.Info{}
-	vi.FileVersion = [4]uint16{1, 0, 0, 0}
-	vi.ProductVersion = [4]uint16{1, 0, 0, 0}
+	vi.FileVersion = [4]uint16{0, 0, 2, 0}
+	vi.ProductVersion = [4]uint16{0, 0, 2, 0}
 	fields := []struct{ key, value string }{
 		{version.ProductName, "SerialMateX"},
 		{version.CompanyName, "TheWInds071"},
@@ -83,8 +83,8 @@ func run(icoPath, manifestPath, target string) error {
 		{version.LegalCopyright, "Copyright (c) 2026 TheWInds071"},
 		{version.OriginalFilename, "SerialMateX.exe"},
 		// 字符串版本号：资源管理器的「详细信息」里显示的就是这两项
-		{version.FileVersion, "1.0.0.0"},
-		{version.ProductVersion, "1.0.0.0"},
+		{version.FileVersion, "0.0.2.0"},
+		{version.ProductVersion, "0.0.2.0"},
 	}
 	for _, f := range fields {
 		if err := vi.Set(version.LangDefault, f.key, f.value); err != nil {
