@@ -18,6 +18,14 @@ func main() {
 	// Create an instance of the app structure
 	app := NewApp()
 
+	// 窗口底色 = 上次用的皮肤背景（前端换肤时写进 ui_config.ini 的 BG-COLOR）。
+	// 这个颜色只在 WebView2 还没画出第一帧时露一下；读不到配置就沿用默认皮肤
+	// Bench 的 --bg-main（#F7F5EF），不会因为配置缺失或写坏而闪黑底。
+	background := options.RGBA{R: 247, G: 245, B: 239, A: 1}
+	if r, g, b, ok := loadStartupBackground(); ok {
+		background = options.RGBA{R: r, G: g, B: b, A: 1}
+	}
+
 	// Create application with options
 	err := wails.Run(&options.App{
 		Title:  "SerialMateX",
@@ -30,9 +38,7 @@ func main() {
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
-		// 窗口底色 = 默认皮肤 Bench 的 --bg-main（#F7F5EF）。这个颜色只在
-		// WebView2 还没画出第一帧时露一下；用深色会让浅色皮肤启动时闪一下黑底。
-		BackgroundColour: &options.RGBA{R: 247, G: 245, B: 239, A: 1},
+		BackgroundColour: &background,
 		OnStartup:        app.startup,
 		Bind: []interface{}{
 			app,
