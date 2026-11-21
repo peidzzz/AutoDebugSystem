@@ -95,7 +95,7 @@ func normalizeUICfgKey(key string) string {
 
 // SaveUIBackground 把界面底色写进 ui_config.ini（前端换肤时调用）。
 // 成功返回空串，失败返回给用户看的错误信息。
-func SaveUIBackground(hex string) string {
+func saveUIBackground(hex string) string {
 	r, g, b, ok := parseHexColor(hex)
 	if !ok {
 		return "颜色值无效：" + hex

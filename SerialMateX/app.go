@@ -628,3 +628,10 @@ func (a *App) QuitApp() {
 	// Quit the application
 	runtime.Quit(a.ctx)
 }
+
+// SaveUIBackground 把当前皮肤的底色写进 ui_config.ini，下次启动时 main.go 先铺这个色，
+// 避免 WebView2 画出第一帧前闪一下默认底色。写不进去（目录只读等）只返回错误文案，
+// 调用方前端是静默忽略的。
+func (a *App) SaveUIBackground(hex string) string {
+	return saveUIBackground(hex)
+}

@@ -65,7 +65,7 @@ func TestSaveUIBackground(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("SERIALMATEX_UICFG_DIR", dir)
 
-	if err := SaveUIBackground("#123456"); err != "" {
+	if err := saveUIBackground("#123456"); err != "" {
 		t.Fatalf("保存失败: %s", err)
 	}
 	r, g, b, ok := loadStartupBackground()
@@ -74,7 +74,7 @@ func TestSaveUIBackground(t *testing.T) {
 	}
 
 	// 覆盖保存第二次要替换而不是追加。
-	if err := SaveUIBackground("#0A0B0C"); err != "" {
+	if err := saveUIBackground("#0A0B0C"); err != "" {
 		t.Fatalf("二次保存失败: %s", err)
 	}
 	raw, err := os.ReadFile(filepath.Join(dir, uiCfgFileName))
@@ -89,7 +89,7 @@ func TestSaveUIBackground(t *testing.T) {
 	}
 
 	// 非法颜色拒绝写入，且不能破坏已有文件。
-	if err := SaveUIBackground("nope"); err == "" {
+	if err := saveUIBackground("nope"); err == "" {
 		t.Fatal("非法颜色应返回错误")
 	}
 	if r, g, b, ok := loadStartupBackground(); !ok || r != 0x0A || g != 0x0B || b != 0x0C {
