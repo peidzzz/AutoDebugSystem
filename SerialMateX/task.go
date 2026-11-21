@@ -568,7 +568,11 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 	endMsg := ""
 	var stopCsv func()
 
+	// 任务结束时的统计（轮数 / 命令 / PING 与失败明细），只由本 goroutine 读写。
+	stats := &taskStats{pingEnabled: cfg.PingEnable}
+
 	for round := 1; round <= cfg.RunCount; round++ {
+		stats.roundsTotal++
 		t.set(func(rt *TaskRuntime) {
 			rt.Round = round
 			rt.CmdIndex = -1
@@ -589,6 +593,7 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			t.appendTaskLog(logPath, taskLogBanner("第 "+strconv.Itoa(round)+" 次上电", device.Name))
 		} else if err := a.sendBytes(device.PowerOn, device.PowerOnHex, device.PowerOnEnter); err != nil {
 			failMsg = "上电失败：" + err.Error()
+			stats.addFailure(round, "power", failMsg)
 			t.set(func(rt *TaskRuntime) { rt.Message = failMsg })
 			aborted = true
 			break
@@ -613,6 +618,14 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 		if !complete && logPath != "" {
 			t.appendMarkedLog(logPath, cmdLogLine(time.Now().Format("15:04:05"), round, failReason))
 		}
+		if len(cmds) > 0 {
+			stats.cmdsTotal++
+			if complete {
+				stats.cmdsNormal++
+			} else {
+				stats.addFailure(round, "cmd", failReason)
+			}
+		}
 
 		if !t.countdown(deadline, "running", "powerOff") {
 			t.set(func(rt *TaskRuntime) { rt.PowerOn = false })
@@ -631,6 +644,12 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			pingRecv, pingErr = a.runPingCheck(cfg.PingIP)
 			passed := pingErr == nil && pingPassed(pingRecv)
 			if !t.stopped() {
+				stats.pingsTotal++
+				if passed {
+					stats.pingsNormal++
+				} else {
+					stats.addFailure(round, "ping", pingFailDetail(cfg.PingIP, pingRecv))
+				}
 				if logPath != "" {
 					t.appendMarkedLog(logPath, pingLogLine(time.Now().Format("15:04:05"), cfg.PingIP, pingRecv, passed))
 				}
@@ -689,6 +708,7 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 		t.set(func(rt *TaskRuntime) { rt.PowerOn = false })
 		if offErr != nil {
 			failMsg = "掉电失败：" + offErr.Error()
+			stats.addFailure(round, "power", failMsg)
 			t.set(func(rt *TaskRuntime) { rt.Message = failMsg })
 		}
 		if logPath != "" {
@@ -699,6 +719,7 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 			stopCsv = nil
 		}
 		if complete && !pingFailed && offErr == nil {
+			stats.roundsNormal++
 			t.set(func(rt *TaskRuntime) { rt.NormalCount++ })
 		}
 		if offErr != nil {
@@ -738,16 +759,16 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 	if aborted {
 		msg = "任务已停止"
 	}
+	// 优先显示真正的失败原因（上电/掉电/电源口写入），其次是用户主动结束，最后才是完成语。
+	finalMsg := msg
+	switch {
+	case failMsg != "":
+		finalMsg = failMsg
+	case endMsg != "":
+		finalMsg = endMsg
+	}
 	t.set(func(rt *TaskRuntime) {
-		// 中途失败时保留具体原因（上电失败 / 掉电失败 / 电源口写入失败），不要被完成语覆盖掉。
-		switch {
-		case failMsg != "":
-			rt.Message = failMsg
-		case endMsg != "":
-			rt.Message = endMsg
-		default:
-			rt.Message = msg
-		}
+		rt.Message = finalMsg
 		rt.Running = false
 		rt.Paused = false
 		rt.PausedReason = ""
@@ -759,6 +780,11 @@ func (a *App) runTask(cfg TaskConfig, cmds []AutoCmd, device PwrDevice, opts Tas
 		rt.CmdPhase = ""
 		rt.CmdCountdown = 0
 	})
+
+	// 统计块写在最后：日志是用户唯一的复盘入口，不能少这一块。
+	if logPath != "" {
+		t.appendTaskLog(logPath, formatTaskSummary(stats, finalMsg, time.Now()))
+	}
 }
 
 // runCommands 在 deadline 之前依次执行命令；complete 为 false 时 reason 说明卡在哪一步
