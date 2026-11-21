@@ -8,8 +8,8 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 )
 
-// Version is the current application version
-const Version = "v1.3.7"
+// Version is the current application version（界面「关于」与检查更新都用它）
+const Version = "v0.0.2"
 
 //go:embed all:frontend/dist
 var assets embed.FS
@@ -17,6 +17,14 @@ var assets embed.FS
 func main() {
 	// Create an instance of the app structure
 	app := NewApp()
+
+	// 窗口底色 = 上次用的皮肤背景（前端换肤时写进 ui_config.ini 的 BG-COLOR）。
+	// 这个颜色只在 WebView2 还没画出第一帧时露一下；读不到配置就沿用默认皮肤
+	// Bench 的 --bg-main（#F7F5EF），不会因为配置缺失或写坏而闪黑底。
+	background := options.RGBA{R: 247, G: 245, B: 239, A: 1}
+	if r, g, b, ok := loadStartupBackground(); ok {
+		background = options.RGBA{R: r, G: g, B: b, A: 1}
+	}
 
 	// Create application with options
 	err := wails.Run(&options.App{
@@ -30,7 +38,7 @@ func main() {
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
-		BackgroundColour: &options.RGBA{R: 27, G: 38, B: 54, A: 1},
+		BackgroundColour: &background,
 		OnStartup:        app.startup,
 		Bind: []interface{}{
 			app,

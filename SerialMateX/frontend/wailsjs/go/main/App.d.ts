@@ -10,6 +10,8 @@ export function Close():Promise<string>;
 
 export function DownloadAndInstallUpdate(arg1:string):Promise<void>;
 
+export function EndTask():Promise<string>;
+
 export function ExportAutoCmds():Promise<string>;
 
 export function ExportAutoCmdsTo(arg1:string,arg2:time.Time):Promise<string>;
@@ -58,6 +60,10 @@ export function SaveTaskConfig(arg1:main.TaskConfig):Promise<void>;
 
 export function SendData(arg1:string):Promise<string>;
 
+export function SkipRound():Promise<string>;
+
 export function StartTask(arg1:main.TaskRunOptions):Promise<string>;
 
 export function StopTask():Promise<string>;
+
+export function SaveUIBackground(arg1:string):Promise<string>;

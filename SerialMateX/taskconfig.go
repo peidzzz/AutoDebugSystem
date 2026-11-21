@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,13 +11,15 @@ import (
 
 // TaskConfig 是 task_config.ini 中的任务参数（TASK 页下半部分）。
 type TaskConfig struct {
-	SaveLog       bool `json:"saveLog"`       // 保存日志
-	SavePower     bool `json:"savePower"`     // 保存功耗
-	InitialState  bool `json:"initialState"`  // 初始状态（开 / 关）
-	AbnormalPause bool `json:"abnormalPause"` // 异常暂停（开 / 关）
-	WaitSeconds  int  `json:"waitSeconds"`  // 运行时间（秒）
-	DelaySeconds int  `json:"delaySeconds"` // 间隔时间（秒）
-	RunCount     int  `json:"runCount"`     // 运行次数（次）
+	SaveLog       bool   `json:"saveLog"`       // 保存日志
+	SavePower     bool   `json:"savePower"`     // 保存功耗
+	InitialState  bool   `json:"initialState"`  // 初始状态（开 / 关）
+	AbnormalPause bool   `json:"abnormalPause"` // 异常暂停（开 / 关）
+	WaitSeconds   int    `json:"waitSeconds"`   // 运行时间（秒）
+	DelaySeconds  int    `json:"delaySeconds"`  // 间隔时间（秒）
+	RunCount      int    `json:"runCount"`      // 运行次数（次）
+	PingEnable    bool   `json:"pingEnable"`    // PING 检测（每轮命令跑完后 ping 目标地址）
+	PingIP        string `json:"pingIP"`        // PING 目标地址（IPv4）
 }
 
 const taskCfgFileName = "task_config.ini"
@@ -39,6 +42,8 @@ const taskCfgTemplate = `; SerialMateX 任务参数配置（TASK 页）
 ; WaitSeconds  = 运行时间（秒）
 ; DelaySeconds = 间隔时间（秒）
 ; RunCount     = 运行次数（次）
+; PingEnable   = PING 检测 0/1
+; PingIP       = PING 目标地址（IPv4）
 
 [Task]
 SaveLog=0
@@ -48,6 +53,8 @@ AbnormalPause=0
 WaitSeconds=5
 DelaySeconds=1
 RunCount=1
+PingEnable=0
+PingIP=
 `
 
 // TaskCfgPath 返回 task_config.ini 的绝对路径（与可执行文件同目录）；
@@ -101,6 +108,11 @@ func (a *App) GetTaskConfig() TaskConfig {
 		}
 		key = strings.ToUpper(strings.NewReplacer("-", "", "_", "", " ", "").Replace(strings.TrimSpace(key)))
 		value = strings.TrimSpace(value)
+		// 行内注释：PingIP=192.168.1.10 ; 目标地址 这种人写的写法不能整串当成值，
+		// 否则 StartTask 会以「PING 目标地址无效」拒绝启动。
+		if i := strings.IndexAny(value, ";#"); i >= 0 {
+			value = strings.TrimSpace(value[:i])
+		}
 		switch key {
 		case "SAVELOG":
 			cfg.SaveLog = parseBoolValue(value)
@@ -122,6 +134,10 @@ func (a *App) GetTaskConfig() TaskConfig {
 			if n, err := strconv.Atoi(value); err == nil {
 				cfg.RunCount = clampInt(n, 1, maxRunCount)
 			}
+		case "PINGENABLE", "PING":
+			cfg.PingEnable = parseBoolValue(value)
+		case "PINGIP", "PINGADDR", "PINGADDRESS", "PINGTARGET":
+			cfg.PingIP = value
 		}
 	}
 	// 当前版本“保存功耗”固定为关（界面已置灰），旧配置里的 1 也按 0 处理
@@ -139,6 +155,12 @@ func (a *App) SaveTaskConfig(cfg TaskConfig) error {
 	wait := clampInt(cfg.WaitSeconds, 0, maxTaskSeconds)
 	delay := clampInt(cfg.DelaySeconds, 0, maxTaskSeconds)
 	runs := clampInt(cfg.RunCount, 1, maxRunCount)
+	pingIP := strings.TrimSpace(cfg.PingIP)
+
+	// PING 地址只在开关打开时校验：手改 ini 写了坏地址的用户必须还能把开关关掉。
+	if cfg.PingEnable && !validIPv4(pingIP) {
+		return fmt.Errorf("PING 目标地址无效：%s", pingIP)
+	}
 
 	var sb strings.Builder
 	sb.WriteString("; SerialMateX 任务参数配置（TASK 页，由界面保存时自动生成）\n")
@@ -148,7 +170,9 @@ func (a *App) SaveTaskConfig(cfg TaskConfig) error {
 	sb.WriteString("; AbnormalPause = 异常暂停 0/1\n")
 	sb.WriteString("; WaitSeconds  = 运行时间（秒）\n")
 	sb.WriteString("; DelaySeconds = 间隔时间（秒）\n")
-	sb.WriteString("; RunCount     = 运行次数（次）\n\n")
+	sb.WriteString("; RunCount     = 运行次数（次）\n")
+	sb.WriteString("; PingEnable   = PING 检测 0/1\n")
+	sb.WriteString("; PingIP       = PING 目标地址（IPv4）\n\n")
 	sb.WriteString("[Task]\n")
 	sb.WriteString("SaveLog=" + boolText(cfg.SaveLog) + "\n")
 	// 当前版本“保存功耗”固定为关（界面已置灰）
@@ -158,6 +182,8 @@ func (a *App) SaveTaskConfig(cfg TaskConfig) error {
 	sb.WriteString("WaitSeconds=" + strconv.Itoa(wait) + "\n")
 	sb.WriteString("DelaySeconds=" + strconv.Itoa(delay) + "\n")
 	sb.WriteString("RunCount=" + strconv.Itoa(runs) + "\n")
+	sb.WriteString("PingEnable=" + boolText(cfg.PingEnable) + "\n")
+	sb.WriteString("PingIP=" + pingIP + "\n")
 
 	return writeFileAtomic(path, sb.String())
 }

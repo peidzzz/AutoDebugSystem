@@ -1,12 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"go.bug.st/serial"
 )
 
 func TestParseHexBytes(t *testing.T) {
@@ -87,6 +93,7 @@ func TestTaskEngineRounds(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	installFakePwrPort(t)
 	app := &App{isConnected: true, connType: TypeSerial}
 	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard", EOL: "\r\n"}); msg != "" {
 		t.Fatalf("启动失败: %s", msg)
@@ -166,8 +173,83 @@ func TestTaskCsvFormatting(t *testing.T) {
 	}
 }
 
+// fakePwrPort 是测试用的电源口：记录写进来的字节，并记住是否打开过 / 关闭过。
+// 真实的串口驱动不能出现在测试里，pwrOpenHook / pwrWriteHook 是唯一的注入点。
+type fakePwrPort struct {
+	mu     sync.Mutex
+	writes [][]byte
+	opened bool
+	closed bool
+}
+
+func (p *fakePwrPort) Write(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.writes = append(p.writes, append([]byte(nil), b...))
+	return len(b), nil
+}
+
+func (p *fakePwrPort) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.closed = true
+	return nil
+}
+
+func (p *fakePwrPort) written() [][]byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([][]byte, len(p.writes))
+	copy(out, p.writes)
+	return out
+}
+
+func (p *fakePwrPort) isOpened() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.opened
+}
+
+func (p *fakePwrPort) isClosed() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.closed
+}
+
+// installFakePwrPort 把打开电源口的实现换成假口，免得测试去碰真实 COM 口。
+func installFakePwrPort(t *testing.T) *fakePwrPort {
+	t.Helper()
+	port := &fakePwrPort{}
+	pwrOpenHook = func(PwrDevice) (io.WriteCloser, error) {
+		port.mu.Lock()
+		port.opened = true
+		port.mu.Unlock()
+		return port, nil
+	}
+	pwrWriteHook = nil
+	t.Cleanup(func() {
+		pwrOpenHook = nil
+		pwrWriteHook = nil
+	})
+	return port
+}
+
+// waitPwrClosed 等关闭真正发生：Running 先置 false、defer 里的 closePwrDevice 在其后执行。
+func waitPwrClosed(t *testing.T, port *fakePwrPort) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if port.isClosed() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("任务结束后电源口没有被关闭")
+}
+
 // writeTaskFixtures 写一套临时配置，供下面几个引擎测试复用。
-func writeTaskFixtures(t *testing.T, cfg, cmds, pwr string) {
+// 返回假的电源口：StartTask 现在会打开电源口，所有用到它的测试都得先装好 hook。
+func writeTaskFixtures(t *testing.T, cfg, cmds, pwr string) *fakePwrPort {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("SERIALMATEX_TASKCFG_DIR", dir)
@@ -183,6 +265,7 @@ func writeTaskFixtures(t *testing.T, cfg, cmds, pwr string) {
 			t.Fatal(err)
 		}
 	}
+	return installFakePwrPort(t)
 }
 
 // waitTaskDone 等到任务停止；返回最后一次运行时快照。
@@ -197,6 +280,25 @@ func waitTaskDone(t *testing.T, app *App, timeout time.Duration) TaskRuntime {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("任务没有在 %v 内结束", timeout)
+	return TaskRuntime{}
+}
+
+// waitTaskPaused 等任务进入异常暂停；返回暂停时的状态快照。
+// 命令里放一条永不匹配的 RX，这一轮就必然走“有命令未执行完”的暂停分支。
+func waitTaskPaused(t *testing.T, app *App, timeout time.Duration) TaskRuntime {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		rt := app.GetTaskRuntime()
+		if rt.Paused {
+			return rt
+		}
+		if !rt.Running {
+			t.Fatalf("任务在进入异常暂停前就结束了: %+v", rt)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("任务没有在 %v 内进入异常暂停: %+v", timeout, app.GetTaskRuntime())
 	return TaskRuntime{}
 }
 
@@ -341,4 +443,628 @@ func TestTaskRuntimeCountdownPhases(t *testing.T) {
 	if !seen["powerOn"] {
 		t.Fatalf("间隔阶段没有显示“N 秒后上电”")
 	}
+}
+
+// TestTaskBuildSerialMode 抽出 buildSerialMode 后行为必须与原来的 OpenSerial 完全一致。
+func TestTaskBuildSerialMode(t *testing.T) {
+	mode := buildSerialMode(115200, 8, 2, "Even")
+	if mode.BaudRate != 115200 || mode.DataBits != 8 || mode.Parity != serial.EvenParity || mode.StopBits != serial.TwoStopBits {
+		t.Fatalf("串口参数映射不对: %+v", mode)
+	}
+
+	mode = buildSerialMode(9600, 8, 15, "None")
+	if mode.Parity != serial.NoParity || mode.StopBits != serial.OnePointFiveStopBits {
+		t.Fatalf("1.5 停止位映射不对: %+v", mode)
+	}
+
+	// 非法值按今天的行为回落到 无校验 / 1 位停止位
+	mode = buildSerialMode(9600, 8, 7, "nope")
+	if mode.Parity != serial.NoParity || mode.StopBits != serial.OneStopBit {
+		t.Fatalf("非法值没有回落: %+v", mode)
+	}
+}
+
+// TestTaskRejectsEmptyPwrPort 设备没配置电源口时必须在启动阶段拒绝，且不打开端口。
+func TestTaskRejectsEmptyPwrPort(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+		"TX ping 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"})
+	if msg == "" {
+		t.Fatal("电源口为空时不应允许启动")
+	}
+	if !strings.Contains(msg, "没有配置 COM 端口") || !strings.Contains(msg, "DemoBoard") {
+		t.Fatalf("错误信息不对: %q", msg)
+	}
+	if app.GetTaskRuntime().Running {
+		t.Fatal("校验失败时任务不应启动")
+	}
+	if port.isOpened() {
+		t.Fatal("校验失败时不应打开电源口")
+	}
+}
+
+// TestTaskRejectsSamePwrPortAsSerial 电源口与 SERIAL 口相同时必须拒绝（大小写不敏感）。
+func TestTaskRejectsSamePwrPortAsSerial(t *testing.T) {
+	for _, serialPort := range []string{"COM7", "com7"} {
+		t.Run(serialPort, func(t *testing.T) {
+			port := writeTaskFixtures(t,
+				"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+				"TX ping 00\n",
+				"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+			)
+
+			app := &App{isConnected: true, connType: TypeSerial, serialPortName: serialPort}
+			msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"})
+			if msg == "" {
+				t.Fatal("电源口与 SERIAL 口相同时不应允许启动")
+			}
+			// 两个端口名都要出现在提示里（大小写不同也指向同一个口，比较时忽略大小写）
+			if !strings.Contains(msg, "COM7") || !strings.Contains(strings.ToUpper(msg), strings.ToUpper(serialPort)) {
+				t.Fatalf("错误信息里应含两个端口名: %q", msg)
+			}
+			if !strings.Contains(msg, "不能与 SERIAL 端口") {
+				t.Fatalf("错误信息不对: %q", msg)
+			}
+			if app.GetTaskRuntime().Running || port.isOpened() {
+				t.Fatal("校验失败时任务不应启动，也不应打开电源口")
+			}
+		})
+	}
+}
+
+// TestTaskReportsPwrOpenError 打开电源口失败时把端口名与底层错误带回界面。
+func TestTaskReportsPwrOpenError(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+		"TX ping 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+	_ = port
+
+	pwrOpenHook = func(PwrDevice) (io.WriteCloser, error) {
+		return nil, errors.New("端口被占用")
+	}
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"})
+	if msg == "" {
+		t.Fatal("打开电源口失败时不应允许启动")
+	}
+	for _, want := range []string{"打开电源端口", "COM7", "端口被占用"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("错误信息里缺少 %q: %q", want, msg)
+		}
+	}
+	if app.GetTaskRuntime().Running {
+		t.Fatal("打开电源口失败时任务不应启动")
+	}
+}
+
+// TestTaskSendsPowerOnOffBytes 一轮任务里上电 / 掉电字节要按设备的 HEX 与回车开关编码，
+// 并且走电源口（不再走 SERIAL）。
+func TestTaskSendsPowerOnOffBytes(t *testing.T) {
+	cases := []struct {
+		name     string
+		extraPwr string
+		wantOn   []byte
+		wantOff  []byte
+	}{
+		{name: "默认 HEX 不加回车", extraPwr: "", wantOn: []byte{0x01}, wantOff: []byte{0x00}},
+		{name: "上电追加回车", extraPwr: "PWR-ON-ENTER=1\n", wantOn: []byte{0x01, '\r'}, wantOff: []byte{0x00}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			port := writeTaskFixtures(t,
+				"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+				"TX ping 00\n",
+				"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n"+c.extraPwr,
+			)
+
+			// 被测板卡的 TX 仍然走 SERIAL，这里用 hook 拦下，避免依赖真实串口。
+			taskSendHook = func(string) string { return "Sent" }
+			defer func() { taskSendHook = nil }()
+
+			app := &App{isConnected: true, connType: TypeSerial}
+			if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+				t.Fatalf("启动失败: %s", msg)
+			}
+			waitTaskDone(t, app, 20*time.Second)
+			waitPwrClosed(t, port)
+
+			writes := port.written()
+			if len(writes) != 2 {
+				t.Fatalf("一轮任务应只有上电 / 掉电两次写入，实际 %d 次: %q", len(writes), writes)
+			}
+			if !bytes.Equal(writes[0], c.wantOn) {
+				t.Fatalf("上电字节不对: got=%v want=%v", writes[0], c.wantOn)
+			}
+			if !bytes.Equal(writes[1], c.wantOff) {
+				t.Fatalf("掉电字节不对: got=%v want=%v", writes[1], c.wantOff)
+			}
+		})
+	}
+}
+
+// TestTaskClosesPwrPortAfterRun 任务正常跑完必须关掉电源口。
+func TestTaskClosesPwrPortAfterRun(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=1\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+		"TX ping 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	taskSendHook = func(string) string { return "Sent" }
+	defer func() { taskSendHook = nil }()
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	rt := waitTaskDone(t, app, 20*time.Second)
+	if rt.NormalCount != 1 {
+		t.Fatalf("一轮应算正常: normal=%d msg=%s", rt.NormalCount, rt.Message)
+	}
+	waitPwrClosed(t, port)
+
+	// 初始状态为开：这一轮只有掉电一次写入
+	writes := port.written()
+	if len(writes) != 1 || !bytes.Equal(writes[0], []byte{0x00}) {
+		t.Fatalf("初始状态为开时不该再发上电: %q", writes)
+	}
+}
+
+// TestTaskClosesPwrPortWhenStopped 中途停止（不同路径）同样要关掉电源口。
+func TestTaskClosesPwrPortWhenStopped(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=1\nAbnormalPause=0\nWaitSeconds=5\nDelaySeconds=0\nRunCount=1\n",
+		"TX ping 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	taskSendHook = func(string) string { return "Sent" }
+	defer func() { taskSendHook = nil }()
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	if msg := app.StopTask(); msg != "" {
+		t.Fatalf("停止失败: %s", msg)
+	}
+	waitTaskDone(t, app, 10*time.Second)
+	waitPwrClosed(t, port)
+}
+
+// TestTaskPauseEndTask 异常暂停中点「结束任务」：先掉电，再结束整个任务（不再跑下一轮）。
+func TestTaskPauseEndTask(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=1\nWaitSeconds=1\nDelaySeconds=0\nRunCount=2\n",
+		"RX never 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	// 没暂停时不能悄悄成功。
+	if msg := app.EndTask(); !strings.Contains(msg, "当前不在异常暂停状态") {
+		t.Fatalf("未暂停时结束任务的提示不对: %q", msg)
+	}
+
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	if rt := waitTaskPaused(t, app, 10*time.Second); rt.PausedReason != "abnormal" {
+		t.Fatalf("暂停原因应为 abnormal: %q", rt.PausedReason)
+	}
+	if msg := app.EndTask(); msg != "" {
+		t.Fatalf("结束任务失败: %s", msg)
+	}
+
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if rt.NormalCount != 0 {
+		t.Fatalf("被结束的那一轮不能算正常: normal=%d", rt.NormalCount)
+	}
+	if rt.Round != 1 {
+		t.Fatalf("结束任务后不能再进下一轮: round=%d", rt.Round)
+	}
+	if !strings.Contains(rt.Message, "已手动结束") {
+		t.Fatalf("结束原因不对: %q", rt.Message)
+	}
+	waitPwrClosed(t, port)
+
+	// 上电 → 结束任务时掉电
+	writes := port.written()
+	want := [][]byte{{0x01}, {0x00}}
+	if len(writes) != len(want) {
+		t.Fatalf("电源写入次数不对: %q", writes)
+	}
+	for i := range want {
+		if !bytes.Equal(writes[i], want[i]) {
+			t.Fatalf("电源写入不对: %q", writes)
+		}
+	}
+}
+
+// TestTaskPauseSkipRound 异常暂停中点「跳过本轮」：掉电、照常等间隔，然后跑下一轮，
+// 但这一轮不计入正常次数。
+func TestTaskPauseSkipRound(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=1\nWaitSeconds=1\nDelaySeconds=1\nRunCount=2\n",
+		"RX never 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	if rt := waitTaskPaused(t, app, 10*time.Second); rt.Round != 1 {
+		t.Fatalf("应在第 1 轮暂停: round=%d", rt.Round)
+	}
+	if msg := app.SkipRound(); msg != "" {
+		t.Fatalf("跳过本轮失败: %s", msg)
+	}
+
+	// 第二轮才喂数据，让这一轮正常跑完（第一轮的命令永远匹配不到）。
+	stopFeed := make(chan struct{})
+	defer close(stopFeed)
+	go func() {
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopFeed:
+				return
+			case <-ticker.C:
+				app.task.feed([]byte("never\r\n"))
+			}
+		}
+	}()
+
+	rt := waitTaskDone(t, app, 20*time.Second)
+	if rt.Round != 2 {
+		t.Fatalf("跳过本轮后应继续第 2 轮: round=%d", rt.Round)
+	}
+	if rt.NormalCount != 1 {
+		t.Fatalf("被跳过的那轮不能算正常: normal=%d msg=%s", rt.NormalCount, rt.Message)
+	}
+	waitPwrClosed(t, port)
+
+	// 上电 → 跳过时掉电 → 下一轮上电 → 掉电
+	writes := port.written()
+	want := [][]byte{{0x01}, {0x00}, {0x01}, {0x00}}
+	if len(writes) != len(want) {
+		t.Fatalf("电源写入次数不对: %q", writes)
+	}
+	for i := range want {
+		if !bytes.Equal(writes[i], want[i]) {
+			t.Fatalf("电源写入不对: %q", writes)
+		}
+	}
+}
+
+// TestTaskPauseStopDoesNotHang 异常暂停中按「停止」必须能结束任务。
+// 旧实现停在裸 <-t.resume 上，这个测试会一直等到 waitTaskDone 超时。
+func TestTaskPauseStopDoesNotHang(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=1\nWaitSeconds=1\nDelaySeconds=0\nRunCount=2\n",
+		"RX never 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	waitTaskPaused(t, app, 10*time.Second)
+
+	if msg := app.StopTask(); msg != "" {
+		t.Fatalf("暂停中停止失败: %s", msg)
+	}
+
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if rt.NormalCount != 0 {
+		t.Fatalf("没跑完的一轮不能算正常: normal=%d", rt.NormalCount)
+	}
+	if !strings.Contains(rt.Message, "已手动结束") {
+		t.Fatalf("暂停中停止应与结束任务同一条路径: %q", rt.Message)
+	}
+	waitPwrClosed(t, port)
+}
+
+// readTaskLog 读回本次运行生成的任务日志（SaveLog=1 的 fixture 只生成一个文件）。
+func readTaskLog(t *testing.T) string {
+	t.Helper()
+	logs, err := filepath.Glob(filepath.Join(os.Getenv("SERIALMATEX_LOGDIR"), "DEBUGLOG_*.log"))
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("应生成 1 个日志文件: %v %v", logs, err)
+	}
+	raw, err := os.ReadFile(logs[0])
+	if err != nil {
+		t.Fatalf("读日志失败: %v", err)
+	}
+	return string(raw)
+}
+
+// TestTaskTxLogLine 任务发出的每条命令都要在日志里留一行 “[TX 时:分:秒] 正文”，
+// 并且前后各恰好一个换行：RX 数据不带换行时 TX 行也不能粘在它后面。
+func TestTaskTxLogLine(t *testing.T) {
+	writeTaskFixtures(t,
+		"[Task]\nSaveLog=1\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=3\nDelaySeconds=0\nRunCount=1\n",
+		"RX ready 01\nTX AT+OK 00 enter=0\nTX AT+OK2 00 enter=0\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	taskSendHook = func(string) string { return "Sent" }
+	defer func() { taskSendHook = nil }()
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+
+	// 只喂一次，且刻意不带换行；RX 命令自带 1 秒延时，保证这段数据先落进日志。
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		app.task.feed([]byte("ready"))
+	}()
+
+	rt := waitTaskDone(t, app, 20*time.Second)
+	if rt.NormalCount != 1 {
+		t.Fatalf("一轮应算正常: normal=%d msg=%s", rt.NormalCount, rt.Message)
+	}
+
+	dir := os.Getenv("SERIALMATEX_LOGDIR")
+	logs, err := filepath.Glob(filepath.Join(dir, "DEBUGLOG_*.log"))
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("应生成 1 个日志文件: %v %v", logs, err)
+	}
+	raw, err := os.ReadFile(logs[0])
+	if err != nil {
+		t.Fatalf("读日志失败: %v", err)
+	}
+	text := string(raw)
+
+	// 逐行检查：每行 TX 前面恰好一个换行（不粘 RX 数据、也不空行），行尾紧跟换行。
+	txLineRe := regexp.MustCompile(`^\[TX \d{2}:\d{2}:\d{2}\] \S+$`)
+	var lines []string
+	from := 0
+	for {
+		idx := strings.Index(text[from:], "[TX ")
+		if idx < 0 {
+			break
+		}
+		idx += from
+		if idx == 0 || text[idx-1] != '\n' {
+			t.Fatalf("第 %d 行 TX 前面没有换行（粘在上一段内容后面了）: %q", len(lines)+1, text)
+		}
+		if idx >= 2 && text[idx-2] == '\n' {
+			t.Fatalf("第 %d 行 TX 前面多了一个换行: %q", len(lines)+1, text)
+		}
+		nl := strings.IndexByte(text[idx:], '\n')
+		if nl < 0 {
+			t.Fatalf("第 %d 行 TX 后面没有换行: %q", len(lines)+1, text)
+		}
+		line := text[idx : idx+nl]
+		if !txLineRe.MatchString(line) {
+			t.Fatalf("TX 行格式不对: %q", line)
+		}
+		lines = append(lines, line)
+		from = idx + nl + 1
+	}
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], " AT+OK") || !strings.HasSuffix(lines[1], " AT+OK2") {
+		t.Fatalf("日志里的 TX 行内容/顺序不对: %q\n%s", lines, text)
+	}
+	// RX 数据确实紧挨着第一行 TX，中间只隔一个换行。
+	if !strings.HasSuffix(text[:strings.Index(text, lines[0])], "ready\n") {
+		t.Fatalf("RX 数据与 TX 行之间不是恰好一个换行: %q", text)
+	}
+}
+
+// TestTaskTxLogLineStripsEOL 默认 enter=1 时设备照收结尾的 CR，但日志行只留正文：
+// 行里不能带 \r，也不能因为“正文自带换行”而变成两行。
+func TestTaskTxLogLineStripsEOL(t *testing.T) {
+	writeTaskFixtures(t,
+		"[Task]\nSaveLog=1\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+		"TX AT+OK 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	var sent string
+	taskSendHook = func(s string) string { sent = s; return "Sent" }
+	defer func() { taskSendHook = nil }()
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if rt.NormalCount != 1 {
+		t.Fatalf("一轮应算正常: normal=%d msg=%s", rt.NormalCount, rt.Message)
+	}
+
+	// 线上发的仍是带 Enter 的原始字节，裁剪只发生在日志/事件里。
+	if sent != "AT+OK\r" {
+		t.Fatalf("发给设备的字节不该被裁剪: %q", sent)
+	}
+
+	text := readTaskLog(t)
+	if strings.Contains(text, "\r") {
+		t.Fatalf("日志里不该出现 \\r: %q", text)
+	}
+	idx := strings.Index(text, "[TX ")
+	if idx < 0 {
+		t.Fatalf("日志里没有 TX 行: %q", text)
+	}
+	if idx == 0 || text[idx-1] != '\n' {
+		t.Fatalf("TX 行前面没有换行: %q", text)
+	}
+	nl := strings.IndexByte(text[idx:], '\n')
+	if nl < 0 {
+		t.Fatalf("TX 行后面没有换行: %q", text)
+	}
+	line := text[idx : idx+nl]
+	if !regexp.MustCompile(`^\[TX \d{2}:\d{2}:\d{2}\] AT\+OK$`).MatchString(line) {
+		t.Fatalf("TX 行应只留正文且不带回车: %q", line)
+	}
+}
+
+// TestTaskTxLogUsesKeyTokens 日志里的功能键要写成 {UP} 这样的标记：
+// 真正发出去的是 ESC 序列，但把它原样写进日志就是乱码。
+func TestTaskTxLogUsesKeyTokens(t *testing.T) {
+	writeTaskFixtures(t,
+		"[Task]\nSaveLog=1\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+		"TX AT+RST{UP} 00 enter=0\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	var sent string
+	taskSendHook = func(s string) string { sent = s; return "Sent" }
+	defer func() { taskSendHook = nil }()
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if rt.NormalCount != 1 {
+		t.Fatalf("一轮应算正常: normal=%d msg=%s", rt.NormalCount, rt.Message)
+	}
+
+	// 线上发的仍是转义序列，只有日志换成标记
+	if sent != "AT+RST\x1b[A" {
+		t.Fatalf("发给设备的字节应为转义序列: %q", sent)
+	}
+
+	text := readTaskLog(t)
+	if strings.ContainsAny(text, "\x1b") {
+		t.Fatalf("日志里不该出现 ESC 字节: %q", text)
+	}
+	idx := strings.Index(text, "[TX ")
+	if idx < 0 {
+		t.Fatalf("日志里没有 TX 行: %q", text)
+	}
+	nl := strings.IndexByte(text[idx:], '\n')
+	if nl < 0 {
+		t.Fatalf("TX 行后面没有换行: %q", text)
+	}
+	line := text[idx : idx+nl]
+	if !regexp.MustCompile(`^\[TX \d{2}:\d{2}:\d{2}\] AT\+RST\{UP\}$`).MatchString(line) {
+		t.Fatalf("TX 行应显示功能键标记: %q", line)
+	}
+}
+
+// TestTaskTxNoLineWhenSendFails 发送失败不留 TX 行：日志只记录真正发出去的字节。
+func TestTaskTxNoLineWhenSendFails(t *testing.T) {
+	writeTaskFixtures(t,
+		"[Task]\nSaveLog=1\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+		"TX AT+OK 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	attempts := 0
+	taskSendHook = func(string) string { attempts++; return "Error: 串口已断开" }
+	defer func() { taskSendHook = nil }()
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if attempts != 1 {
+		t.Fatalf("应尝试发送 1 次: %d", attempts)
+	}
+	if rt.NormalCount != 0 {
+		t.Fatalf("发送失败的一轮不能算正常: normal=%d", rt.NormalCount)
+	}
+	if text := readTaskLog(t); strings.Contains(text, "[TX ") {
+		t.Fatalf("发送失败不该记 TX 行: %q", text)
+	}
+}
+
+// TestTaskPauseSkipLastRound 最后一轮被跳过：电源照样掉电，任务以“跳过”为原因结束，
+// 不能报成“任务完成”（那一轮并没有正常跑完）。
+func TestTaskPauseSkipLastRound(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=1\nWaitSeconds=1\nDelaySeconds=0\nRunCount=1\n",
+		"RX never 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	waitTaskPaused(t, app, 10*time.Second)
+	if msg := app.SkipRound(); msg != "" {
+		t.Fatalf("跳过本轮失败: %s", msg)
+	}
+
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if rt.Round != 1 {
+		t.Fatalf("最后一轮被跳过，不能凭空多跑一轮: round=%d", rt.Round)
+	}
+	if rt.NormalCount != 0 {
+		t.Fatalf("被跳过的一轮不能算正常: normal=%d", rt.NormalCount)
+	}
+	if !strings.Contains(rt.Message, "已跳过最后一轮") {
+		t.Fatalf("最后一轮被跳过时结束原因不对: %q", rt.Message)
+	}
+	waitPwrClosed(t, port)
+
+	// 上电 → 跳过时掉电（没有下一轮上电）
+	writes := port.written()
+	want := [][]byte{{0x01}, {0x00}}
+	if len(writes) != len(want) {
+		t.Fatalf("电源写入次数不对: %q", writes)
+	}
+	for i := range want {
+		if !bytes.Equal(writes[i], want[i]) {
+			t.Fatalf("电源写入不对: %q", writes)
+		}
+	}
+}
+
+// TestTaskAbortsWhenPwrWriteFails 电源口写入失败必须中止任务，并把原因留在 Message 里。
+func TestTaskAbortsWhenPwrWriteFails(t *testing.T) {
+	port := writeTaskFixtures(t,
+		"[Task]\nSaveLog=0\nSavePower=0\nInitialState=0\nAbnormalPause=0\nWaitSeconds=5\nDelaySeconds=0\nRunCount=1\n",
+		"TX ping 00\n",
+		"[DemoBoard]\nName=DemoBoard\nPort=COM7\nPWR-ON=0x01\nPWR-OFF=0x00\n",
+	)
+
+	pwrWriteHook = func([]byte) error { return errors.New("串口已拔出") }
+
+	app := &App{isConnected: true, connType: TypeSerial}
+	if msg := app.StartTask(TaskRunOptions{DeviceName: "DemoBoard"}); msg != "" {
+		t.Fatalf("启动失败: %s", msg)
+	}
+	rt := waitTaskDone(t, app, 10*time.Second)
+	if rt.NormalCount != 0 {
+		t.Fatalf("写失败的一轮不能算正常: normal=%d", rt.NormalCount)
+	}
+	if !strings.Contains(rt.Message, "电源口写入失败") || !strings.Contains(rt.Message, "串口已拔出") {
+		t.Fatalf("中止原因不对: %q", rt.Message)
+	}
+	waitPwrClosed(t, port)
+}
+
+// TestTaskWritePwrPortWithoutOpen 未打开时返回错误而不 panic；重复关闭也安全。
+func TestTaskWritePwrPortWithoutOpen(t *testing.T) {
+	pwrOpenHook = nil
+	pwrWriteHook = nil
+	defer func() { pwrOpenHook = nil; pwrWriteHook = nil }()
+
+	app := &App{}
+	if err := app.writePwrPort([]byte{0x01}); err == nil {
+		t.Fatal("电源口未打开时应返回错误")
+	}
+	// closePwrDevice 必须幂等：defer 与错误路径都可能调用它
+	app.closePwrDevice()
+	app.closePwrDevice()
 }

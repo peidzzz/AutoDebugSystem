@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -96,5 +97,307 @@ func TestGetPwrDevicesCreatesIni(t *testing.T) {
 	devices = app.GetPwrDevices()
 	if len(devices) != 1 || devices[0].Name != "我的板卡" || devices[0].Port != "COM5" || devices[0].PowerOn != "0x11" {
 		t.Fatalf("custom file mismatch: %+v", devices)
+	}
+}
+
+// TestPwrDevDefaultsForOldSection 验证只有 4 个老键的段在解析后拿到今天的缺省行为：
+// 9600/8/1/None，上电与掉电都按十六进制解析、都不追加回车。
+func TestPwrDevDefaultsForOldSection(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pwr_dev.ini")
+	content := `[OldBoard]
+Name=OldBoard
+Port=COM3
+PWR-ON=0x01
+PWR-OFF=0x00
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	devices, err := parsePwrDevFile(path)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(devices) != 1 {
+		t.Fatalf("want 1 device, got %d: %+v", len(devices), devices)
+	}
+
+	d := devices[0]
+	if d.Baud != 9600 || d.DataBits != 8 || d.StopBits != 1 || d.Parity != "None" {
+		t.Errorf("serial defaults mismatch: %+v", d)
+	}
+	if !d.PowerOnHex || d.PowerOnEnter || !d.PowerOffHex || d.PowerOffEnter {
+		t.Errorf("switch defaults mismatch: %+v", d)
+	}
+}
+
+// TestPwrDevParsesNewKeys 验证新增的串口参数键与 HEX/回车开关能被解析，停止位 1.5 归一为 15。
+func TestPwrDevParsesNewKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pwr_dev.ini")
+	content := `[BoardNew]
+Name=BoardNew
+Port=COM9
+BAUD=115200
+DATA=7
+STOP=1.5
+PARITY=Odd
+PWR-ON=0x02
+PWR-ON-HEX=0
+PWR-ON-ENTER=1
+PWR-OFF=0x03
+PWR-OFF-HEX=1
+PWR-OFF-ENTER=0
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	devices, err := parsePwrDevFile(path)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(devices) != 1 {
+		t.Fatalf("want 1 device, got %d: %+v", len(devices), devices)
+	}
+
+	d := devices[0]
+	if d.Baud != 115200 || d.DataBits != 7 || d.StopBits != 15 || d.Parity != "Odd" {
+		t.Errorf("serial params mismatch: %+v", d)
+	}
+	if d.PowerOnHex || !d.PowerOnEnter || !d.PowerOffHex || d.PowerOffEnter {
+		t.Errorf("switch values mismatch: %+v", d)
+	}
+}
+
+// TestPwrDevKeyAliases 验证中文/下划线写法的键与短横线写法等价。
+func TestPwrDevKeyAliases(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pwr_dev.ini")
+	content := `[AliasBoard]
+波特率=57600
+数据位=8
+停止位=2
+校验位=Even
+上电HEX=0
+上电回车=1
+PWR_OFF_HEX=0
+PWR_OFF_ENTER=1
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	devices, err := parsePwrDevFile(path)
+	if err != nil {
+		t.Fatalf("parse error: %v", err)
+	}
+	if len(devices) != 1 {
+		t.Fatalf("want 1 device, got %d: %+v", len(devices), devices)
+	}
+
+	d := devices[0]
+	if d.Baud != 57600 || d.DataBits != 8 || d.StopBits != 2 || d.Parity != "Even" {
+		t.Errorf("alias serial params mismatch: %+v", d)
+	}
+	if d.PowerOnHex || !d.PowerOnEnter || d.PowerOffHex || !d.PowerOffEnter {
+		t.Errorf("alias switch values mismatch: %+v", d)
+	}
+}
+
+// TestPwrDevStopBitsEquivalent 验证 STOP=15（内部值）与 STOP=1.5 解析成同一个内部值。
+func TestPwrDevStopBitsEquivalent(t *testing.T) {
+	for _, raw := range []string{"1.5", "15"} {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "pwr_dev.ini")
+		content := "[Board]\nPort=COM2\nSTOP=" + raw + "\n"
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		devices, err := parsePwrDevFile(path)
+		if err != nil {
+			t.Fatalf("STOP=%s parse error: %v", raw, err)
+		}
+		if len(devices) != 1 || devices[0].StopBits != 15 {
+			t.Errorf("STOP=%s: want stopBits 15, got %+v", raw, devices)
+		}
+	}
+}
+
+// TestPwrDevSaveParseRoundTrip 验证保存再解析时 12 个键原样回来，
+// 包括两个 HEX 开关、两个回车开关，且文件里停止位写成 1.5。
+func TestPwrDevSaveParseRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("SERIALMATEX_PWRDEV_DIR", dir)
+	app := &App{}
+
+	want := PwrDevice{
+		Name:          "BoardX",
+		Port:          "COM9",
+		Baud:          57600,
+		DataBits:      7,
+		StopBits:      15,
+		Parity:        "Even",
+		PowerOn:       "0x02 0x03",
+		PowerOff:      "AA 00",
+		PowerOnHex:    false,
+		PowerOnEnter:  true,
+		PowerOffHex:   true,
+		PowerOffEnter: true,
+	}
+	if err := app.SavePwrDevices([]PwrDevice{want}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	got := app.GetPwrDevices()
+	if len(got) != 1 {
+		t.Fatalf("want 1 device, got %d: %+v", len(got), got)
+	}
+	if got[0] != want {
+		t.Errorf("round trip mismatch:\n got %+v\nwant %+v", got[0], want)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "pwr_dev.ini"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range []string{
+		"Name=BoardX", "Port=COM9", "BAUD=57600", "DATA=7", "STOP=1.5",
+		"PARITY=Even", "PWR-ON=0x02 0x03", "PWR-ON-HEX=0", "PWR-ON-ENTER=1",
+		"PWR-OFF=AA 00", "PWR-OFF-HEX=1", "PWR-OFF-ENTER=1",
+	} {
+		if !strings.Contains(string(raw), line) {
+			t.Errorf("ini missing %q:\n%s", line, raw)
+		}
+	}
+}
+
+// TestPwrDevParseBoolText 验证布尔文本的 Accepted 写法与非法输入。
+func TestPwrDevParseBoolText(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+		ok   bool
+	}{
+		{"1", true, true},
+		{"0", false, true},
+		{"true", true, true},
+		{"false", false, true},
+		{"on", true, true},
+		{"off", false, true},
+		{"是", true, true},
+		{"否", false, true},
+		{" TRUE ", true, true},
+		{"", false, false},
+		{"yes", false, false},
+		{"2", false, false},
+	}
+	for _, c := range cases {
+		got, ok := parseBoolText(c.in)
+		if got != c.want || ok != c.ok {
+			t.Errorf("parseBoolText(%q) = (%v, %v), want (%v, %v)", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// TestPwrDevParityNormalized 验证校验位的大小写与常见别名都被收敛到
+// app.go 的串口映射认得的那 5 个写法；认不出的按 None（缺省）处理。
+func TestPwrDevParityNormalized(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"None", "None"},
+		{"none", "None"},
+		{" NONE ", "None"},
+		{"odd", "Odd"},
+		{"ODD", "Odd"},
+		{"Even", "Even"},
+		{"mark", "Mark"},
+		{"SPACE", "Space"},
+		{"无", "None"},
+		{"奇", "Odd"},
+		{"偶", "Even"},
+		{"", "None"},
+		{"banana", "None"},
+	}
+	for _, c := range cases {
+		path := filepath.Join(t.TempDir(), "pwr_dev.ini")
+		content := "[Board]\nPort=COM3\nPARITY=" + c.in + "\n"
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		devices, err := parsePwrDevFile(path)
+		if err != nil {
+			t.Fatalf("PARITY=%q parse error: %v", c.in, err)
+		}
+		if len(devices) != 1 {
+			t.Fatalf("PARITY=%q: want 1 device, got %+v", c.in, devices)
+		}
+		if devices[0].Parity != c.want {
+			t.Errorf("PARITY=%q: got %q, want %q", c.in, devices[0].Parity, c.want)
+		}
+	}
+}
+
+// TestPwrDevSaveAppliesDefaults 验证保存时会把缺省值补齐再落盘：
+// 零值设备（例如手工构造或老界面传来的）不能写出 BAUD=0/DATA=0/PARITY= 这样的坏值，
+// 否则下次解析只能靠 withDefaults 兜，文件本身已经不可读。
+func TestPwrDevSaveAppliesDefaults(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("SERIALMATEX_PWRDEV_DIR", dir)
+	app := &App{}
+
+	if err := app.SavePwrDevices([]PwrDevice{{Name: "Zero", Port: "COM5"}}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(dir, "pwr_dev.ini"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range []string{"BAUD=9600", "DATA=8", "STOP=1", "PARITY=None"} {
+		if !strings.Contains(string(raw), line) {
+			t.Errorf("ini missing default %q:\n%s", line, raw)
+		}
+	}
+	for _, bad := range []string{"BAUD=0", "DATA=0", "PARITY=\n"} {
+		if strings.Contains(string(raw), bad) {
+			t.Errorf("ini must not contain %q:\n%s", bad, raw)
+		}
+	}
+}
+
+// TestPwrDevDataBitsClamped 验证数据位只接受 5–8（串口驱动的合法范围），
+// 越界值（含老文件里的 0/9/16）统一回落成缺省 8，而不是把非法值原样交给驱动。
+func TestPwrDevDataBitsClamped(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int
+	}{
+		{"5", 5},
+		{"6", 6},
+		{"7", 7},
+		{"8", 8},
+		{"4", 8},
+		{"9", 8},
+		{"16", 8},
+		{"0", 8},
+		{"abc", 8},
+	}
+	for _, c := range cases {
+		path := filepath.Join(t.TempDir(), "pwr_dev.ini")
+		if err := os.WriteFile(path, []byte("[B]\nDATA="+c.in+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		devices, err := parsePwrDevFile(path)
+		if err != nil {
+			t.Fatalf("DATA=%q: %v", c.in, err)
+		}
+		if len(devices) != 1 || devices[0].DataBits != c.want {
+			t.Errorf("DATA=%q: got %+v, want dataBits %d", c.in, devices, c.want)
+		}
 	}
 }

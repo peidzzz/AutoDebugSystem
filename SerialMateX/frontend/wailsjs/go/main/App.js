@@ -14,6 +14,10 @@ export function DownloadAndInstallUpdate(arg1) {
   return window['go']['main']['App']['DownloadAndInstallUpdate'](arg1);
 }
 
+export function EndTask() {
+  return window['go']['main']['App']['EndTask']();
+}
+
 export function ExportAutoCmds() {
   return window['go']['main']['App']['ExportAutoCmds']();
 }
@@ -110,10 +114,18 @@ export function SendData(arg1) {
   return window['go']['main']['App']['SendData'](arg1);
 }
 
+export function SkipRound() {
+  return window['go']['main']['App']['SkipRound']();
+}
+
 export function StartTask(arg1) {
   return window['go']['main']['App']['StartTask'](arg1);
 }
 
 export function StopTask() {
   return window['go']['main']['App']['StopTask']();
+}
+
+export function SaveUIBackground(arg1) {
+  return window['go']['main']['App']['SaveUIBackground'](arg1);
 }
